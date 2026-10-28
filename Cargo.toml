@@ -1,0 +1,71 @@
+[package]
+name = "ict-trading-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "Low-latency, multi-exchange ICT crypto futures trading engine"
+
+[features]
+default = ["binance", "bybit", "okx"]
+binance = []
+bybit = []
+okx = []
+
+[dependencies]
+# Async runtime and cancellation.
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+async-trait = "0.1.92"
+futures-util = { version = "0.3.34", features = ["sink"] }
+
+# Transport. Both clients use rustls so deployment does not depend on OpenSSL.
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls", "http2"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+http = "1.5"
+url = "2.5.8"
+
+# Lossless domain data and wire formats.
+rust_decimal = { version = "1.43", features = ["serde-with-str"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_urlencoded = "0.7.1"
+bytes = "1.12"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = { version = "0.10.4", features = ["serde"] }
+uuid = { version = "1.29", features = ["v4", "v5", "serde"] }
+
+# Exchange authentication and secret handling.
+hmac = "0.13"
+sha2 = "0.11.1"
+hex = "0.4.3"
+base64 = "0.23.1"
+secrecy = { version = "0.10.3", features = ["serde"] }
+
+# Errors, observability, and reconnect jitter.
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+rand = "0.10.3"
+
+[dev-dependencies]
+proptest = "1.12"
+wiremock = "0.6.5"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+float_arithmetic = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

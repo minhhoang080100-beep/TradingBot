@@ -1,0 +1,22 @@
+# Deny by default: only locked Cargo metadata and Rust sources enter the build.
+# This excludes .git, logs, local scripts, target, paper-runs, docs and fixtures.
+**
+!Cargo.toml
+!Cargo.lock
+!Dockerfile
+!src/
+!src/**
+
+# Preserve these exclusions even if someone places local material under src/.
+**/.git
+**/.git/**
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/target
+**/target/**
+**/paper-runs
+**/paper-runs/**
+**/scripts
+**/scripts/**
