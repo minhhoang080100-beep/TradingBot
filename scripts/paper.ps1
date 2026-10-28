@@ -1,5 +1,6 @@
 # Run the keyless PAPER simulator in the foreground from the repository root.
 # Examples (PowerShell):
+#   .\scripts\paper.ps1 portfolio --symbols "BTCUSDT,ETHUSDT" --leverage 10 --balance 100 --seconds 300
 #   .\scripts\paper.ps1 live --symbol ETHUSDT --balance 100 --seconds 300
 #   .\scripts\paper.ps1 live --poll-seconds 5 --warmup 500 --fee-bps 6 --stop-slippage-bps 2
 #   .\scripts\paper.ps1 replay --input paper-runs\LIVE_SESSION.jsonl --output paper-runs\replay.jsonl

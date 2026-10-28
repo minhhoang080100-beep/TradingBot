@@ -19,6 +19,7 @@ pub mod paper;
 pub mod reconciliation;
 pub mod risk;
 pub mod strategy;
+pub mod telegram;
 
 pub use candle_store::{
     CandleGap, CandleKey, CandleStore, CandleStoreError, SharedCandleStore, StoreDisposition,

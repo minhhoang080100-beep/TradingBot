@@ -43,7 +43,7 @@ pub struct Header {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InstrumentDto {
+pub(super) struct InstrumentDto {
     exchange: Exchange,
     market: MarketKind,
     venue_symbol: String,
@@ -65,6 +65,38 @@ struct ConfigDto {
     stop_slippage_bps: String,
     max_notional_fraction: String,
     min_net_rr: String,
+}
+
+impl InstrumentDto {
+    pub(super) fn capture(instrument: &PaperInstrument) -> Self {
+        let spec = &instrument.spec;
+        Self {
+            exchange: spec.instrument().exchange,
+            market: spec.instrument().market,
+            venue_symbol: spec.instrument().venue_symbol.to_string(),
+            canonical_symbol: spec.instrument().canonical_symbol.to_string(),
+            price_tick: spec.price_tick().to_string(),
+            quantity_step: spec.quantity_step().to_string(),
+            minimum_quantity: spec.minimum_quantity().to_string(),
+            maximum_quantity: spec.maximum_quantity().map(|value| value.to_string()),
+            quote_value_per_price_unit: spec.quote_value_per_price_unit().to_string(),
+            min_notional: instrument.min_notional.to_string(),
+        }
+    }
+
+    pub(super) fn restore(&self) -> Result<PaperInstrument, BoxError> {
+        Ok(PaperInstrument {
+            spec: InstrumentRiskSpec::new(
+                InstrumentId::new(self.exchange, self.market, &self.venue_symbol, &self.canonical_symbol)?,
+                decimal(&self.price_tick)?,
+                decimal(&self.quantity_step)?,
+                decimal(&self.minimum_quantity)?,
+                self.maximum_quantity.as_deref().map(decimal).transpose()?,
+                decimal(&self.quote_value_per_price_unit)?,
+            )?,
+            min_notional: decimal(&self.min_notional)?,
+        })
+    }
 }
 
 impl Header {
@@ -371,7 +403,7 @@ pub fn replay(input: &Path, output: &Path) -> Result<PaperSnapshot, BoxError> {
     Ok(snapshot)
 }
 
-fn next_line(reader: &mut impl BufRead, total: &mut u64) -> Result<Option<Vec<u8>>, BoxError> {
+pub(super) fn next_line(reader: &mut impl BufRead, total: &mut u64) -> Result<Option<Vec<u8>>, BoxError> {
     let mut line = Vec::new();
     loop {
         let available = reader.fill_buf()?;
@@ -416,7 +448,7 @@ fn decode(line: &[u8]) -> Result<Record, BoxError> {
     Ok(serde_json::from_value(value.0)?)
 }
 
-fn parse_candle(value: &Value) -> Result<Candle, BoxError> {
+pub(super) fn parse_candle(value: &Value) -> Result<Candle, BoxError> {
     exact_keys(
         value,
         &[
@@ -458,7 +490,7 @@ fn exact_keys(value: &Value, fields: &[&str]) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn decimal(value: &str) -> Result<Decimal, BoxError> {
+pub(super) fn decimal(value: &str) -> Result<Decimal, BoxError> {
     let unsigned = value.strip_prefix('-').unwrap_or(value);
     let (whole, fraction) = unsigned
         .split_once('.')
@@ -482,7 +514,7 @@ fn decimal(value: &str) -> Result<Decimal, BoxError> {
 fn required_option<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     Option::deserialize(deserializer)
 }
-fn invalid(message: &'static str) -> BoxError {
+pub(super) fn invalid(message: &'static str) -> BoxError {
     io::Error::new(io::ErrorKind::InvalidData, message).into()
 }
 fn valid_label(value: &str, maximum: usize) -> bool {
@@ -492,7 +524,7 @@ fn valid_label(value: &str, maximum: usize) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_graphic() || byte == b' ')
 }
-fn validate_summary(
+pub(super) fn validate_summary(
     at: DateTime<Utc>,
     reason: &str,
     last_close: Option<DateTime<Utc>>,
@@ -503,7 +535,7 @@ fn validate_summary(
     Ok(())
 }
 
-struct UniqueValue(Value);
+pub(super) struct UniqueValue(pub(super) Value);
 impl<'de> Deserialize<'de> for UniqueValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Visitor;

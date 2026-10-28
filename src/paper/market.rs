@@ -68,7 +68,7 @@ impl PublicPaperMarket {
     /// wrong product/currency, and any instrument not currently `Trading`.
     pub async fn instrument(&self, symbol: &str) -> Result<PaperInstrument, PaperMarketError> {
         validate_symbol(symbol)?;
-        let body = self
+        let (status, body) = self
             .get(
                 "/v5/market/instruments-info",
                 &[
@@ -77,7 +77,7 @@ impl PublicPaperMarket {
                 ],
             )
             .await?;
-        parse_instrument(symbol, 200, &body)
+        parse_instrument(symbol, status, &body)
     }
 
     /// Reads up to `limit` fully closed bars, normalized in ascending time order.
@@ -111,7 +111,7 @@ impl PublicPaperMarket {
             .checked_sub(1)
             .filter(|value| *value >= 0)
             .ok_or(PaperMarketError::InvalidTime)?;
-        let body = self
+        let (status, body) = self
             .get(
                 "/v5/market/kline",
                 &[
@@ -123,14 +123,14 @@ impl PublicPaperMarket {
                 ],
             )
             .await?;
-        let candles = parse_closed_candles(instrument, timeframe, now, 200, &body)?;
+        let candles = parse_closed_candles(instrument, timeframe, now, status, &body)?;
         if candles.len() > usize::from(limit) {
             return Err(PaperMarketError::InvalidCandles);
         }
         Ok(candles)
     }
 
-    async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<u8>, PaperMarketError> {
+    async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<(u16, Vec<u8>), PaperMarketError> {
         let mut response = self
             .client
             .get(format!("{}{path}", self.origin))
@@ -140,7 +140,7 @@ impl PublicPaperMarket {
             .map_err(|_| PaperMarketError::Transport)?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            return Err(PaperMarketError::HttpStatus(status));
+            return Err(http_status_error(status, response.headers(), Utc::now()));
         }
         if response
             .content_length()
@@ -159,7 +159,7 @@ impl PublicPaperMarket {
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(body)
+        Ok((status, body))
     }
 
     #[cfg(test)]
@@ -168,6 +168,49 @@ impl PublicPaperMarket {
         market.origin = origin;
         Ok(market)
     }
+}
+
+fn http_status_error(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    now: DateTime<Utc>,
+) -> PaperMarketError {
+    if !matches!(status, 429 | 503) {
+        return PaperMarketError::HttpStatus(status);
+    }
+    let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
+    let Some(value) = values.next() else {
+        return PaperMarketError::HttpStatus(status);
+    };
+    // A combined/duplicated or unsupported field is not permission to retry
+    // earlier. Do not retain its raw value in an error or a log message.
+    if values.next().is_some() {
+        return PaperMarketError::InvalidRetryAfter(status);
+    }
+    match value.to_str().ok().and_then(|value| parse_retry_after(value, now)) {
+        Some(delay) => PaperMarketError::HttpRetryAfter { status, delay },
+        None => PaperMarketError::InvalidRetryAfter(status),
+    }
+}
+
+fn parse_retry_after(value: &str, now: DateTime<Utc>) -> Option<Duration> {
+    let value = value.trim_matches([' ', '\t']);
+    if value.is_empty() || value.len() > 96 {
+        return None;
+    }
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse::<u64>().ok().map(Duration::from_secs);
+    }
+    // Support the preferred HTTP-date format (IMF-fixdate). Obsolete or
+    // otherwise ambiguous formats fail closed instead of discarding the hint.
+    let date = DateTime::parse_from_rfc2822(value).ok()?.with_timezone(&Utc);
+    if date.format("%a, %d %b %Y %H:%M:%S GMT").to_string() != value {
+        return None;
+    }
+    if date <= now {
+        return Some(Duration::ZERO);
+    }
+    date.signed_duration_since(now).to_std().ok()
 }
 
 /// Parses current Bybit linear-USDT perpetual metadata without any network I/O.
@@ -370,6 +413,12 @@ struct Envelope<T> {
     time: Option<i64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusEnvelope {
+    ret_code: i64,
+}
+
 fn decode<T: DeserializeOwned>(status: u16, body: &[u8]) -> Result<Envelope<T>, PaperMarketError> {
     if !(200..300).contains(&status) {
         return Err(PaperMarketError::HttpStatus(status));
@@ -377,12 +426,43 @@ fn decode<T: DeserializeOwned>(status: u16, body: &[u8]) -> Result<Envelope<T>, 
     if body.len() > MAX_BODY_BYTES {
         return Err(PaperMarketError::ResponseTooLarge);
     }
-    let envelope: Envelope<T> =
-        serde_json::from_slice(body).map_err(|_| PaperMarketError::MalformedResponse)?;
+    // Error responses need not contain the success endpoint's result shape.
+    // Parse the original bytes twice instead of collapsing them into Value:
+    // derived typed deserialization keeps duplicate known fields fatal.
+    let status_envelope: StatusEnvelope = serde_json::from_slice(body)
+        .map_err(|error| decode_error(status, body.len(), ResponseDecodePhase::Envelope, &error))?;
+    if status_envelope.ret_code != 0 {
+        return Err(PaperMarketError::Venue(status_envelope.ret_code));
+    }
+    let envelope: Envelope<T> = serde_json::from_slice(body)
+        .map_err(|error| decode_error(status, body.len(), ResponseDecodePhase::SuccessSchema, &error))?;
+    // The second typed pass must agree; keep the field validated, not ignored.
     if envelope.ret_code != 0 {
         return Err(PaperMarketError::Venue(envelope.ret_code));
     }
     Ok(envelope)
+}
+
+fn decode_error(
+    status: u16,
+    body_bytes: usize,
+    phase: ResponseDecodePhase,
+    error: &serde_json::Error,
+) -> PaperMarketError {
+    let category = match error.classify() {
+        serde_json::error::Category::Io => ResponseDecodeCategory::Io,
+        serde_json::error::Category::Syntax => ResponseDecodeCategory::Syntax,
+        serde_json::error::Category::Data => ResponseDecodeCategory::Data,
+        serde_json::error::Category::Eof => ResponseDecodeCategory::Eof,
+    };
+    PaperMarketError::MalformedResponse {
+        status,
+        phase,
+        category,
+        line: error.line(),
+        column: error.column(),
+        body_bytes,
+    }
 }
 
 #[derive(Deserialize)]
@@ -433,6 +513,28 @@ struct KlineResponse {
     list: Vec<[String; 7]>,
 }
 
+/// Which typed stage rejected a public response, without including its content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseDecodePhase {
+    /// The minimal status envelope could not be decoded.
+    Envelope,
+    /// Status was successful, but the endpoint's full schema did not decode.
+    SuccessSchema,
+}
+
+/// Sanitized serde classification, never a field name, value or response body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResponseDecodeCategory {
+    /// An input I/O error (not expected for an in-memory body).
+    Io,
+    /// The body is not syntactically valid JSON.
+    Syntax,
+    /// JSON data conflicts with the required typed response schema.
+    Data,
+    /// The JSON body ended before a complete value was decoded.
+    Eof,
+}
+
 /// Sanitized public-market failures without response payloads or network URLs.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PaperMarketError {
@@ -445,12 +547,36 @@ pub enum PaperMarketError {
     /// HTTP response was not successful, including redirects.
     #[error("paper public-market HTTP status {0}")]
     HttpStatus(u16),
+    /// HTTP 429/503 with a validated minimum retry delay from the server.
+    #[error("paper public-market HTTP status {status}; retry delay {delay:?}")]
+    HttpRetryAfter {
+        /// The non-success HTTP status; only 429/503 are retry eligible.
+        status: u16,
+        /// Minimum delay, not a suggestion to shorten to a local retry cap.
+        delay: Duration,
+    },
+    /// A 429/503 retry hint was ambiguous, malformed or unsupported.
+    #[error("paper public-market HTTP status {0}; retry delay unavailable or invalid")]
+    InvalidRetryAfter(u16),
     /// Public response exceeded one MiB.
     #[error("paper public-market response too large")]
     ResponseTooLarge,
-    /// A required JSON field/type was absent or malformed.
-    #[error("malformed paper public-market response")]
-    MalformedResponse,
+    /// Safe decode metadata; raw serde messages can contain upstream data.
+    #[error("malformed paper public-market response (http={status}, phase={phase:?}, category={category:?}, line={line}, column={column}, bytes={body_bytes})")]
+    MalformedResponse {
+        /// Successful HTTP status associated with the body.
+        status: u16,
+        /// Minimal status-envelope or success-schema validation stage.
+        phase: ResponseDecodePhase,
+        /// Sanitized serde classification.
+        category: ResponseDecodeCategory,
+        /// One-based input line, as reported by serde.
+        line: usize,
+        /// Input column, as reported by serde; zero is possible at EOF.
+        column: usize,
+        /// Number of response-body bytes, not the body itself.
+        body_bytes: usize,
+    },
     /// Venue explicitly reported failure; its free-form message is discarded.
     #[error("paper public-market venue code {0}")]
     Venue(i64),
@@ -481,6 +607,40 @@ pub enum PaperMarketError {
     /// Requested bar count is outside the public endpoint's range.
     #[error("paper candle limit must be between 1 and 1000")]
     InvalidLimit,
+}
+
+impl PaperMarketError {
+    /// Whether a bounded caller may retry this read-only public GET failure.
+    ///
+    /// The client itself always performs one attempt. Schema/invariant failures,
+    /// authorization/region failures and unusable Retry-After hints fail closed.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport
+            | Self::HttpStatus(408 | 429 | 500 | 502 | 503 | 504)
+            | Self::HttpRetryAfter { status: 429 | 503, .. }
+            | Self::Venue(10000 | 10006 | 10016) => true,
+            Self::MalformedResponse {
+                status,
+                phase: ResponseDecodePhase::Envelope,
+                category: ResponseDecodeCategory::Syntax | ResponseDecodeCategory::Eof,
+                ..
+            } => *status >= 200 && *status < 300,
+            _ => false,
+        }
+    }
+
+    /// Minimum server-specified retry delay when safely parsed from HTTP429/503.
+    ///
+    /// A caller unable to wait this long must stop rather than retry early.
+    #[must_use]
+    pub const fn suggested_retry_delay(&self) -> Option<Duration> {
+        match self {
+            Self::HttpRetryAfter { status: 429 | 503, delay } => Some(*delay),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -808,6 +968,248 @@ mod tests {
             parse_instrument("BTCUSDT", 200, &vec![b' '; MAX_BODY_BYTES + 1]),
             Err(PaperMarketError::ResponseTooLarge)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn venue_errors_do_not_require_a_success_result_shape() -> TestResult {
+        for code in [10000, 10006, 10016, 10001, 10009, 10024] {
+            for result in [json!({}), Value::Null, json!("not a success result"), json!([])] {
+                let body = serde_json::to_vec(&json!({
+                    "retCode": code,
+                    "retMsg": "secret upstream detail",
+                    "result": result,
+                }))?;
+                assert_eq!(parse_instrument("BTCUSDT", 200, &body), Err(PaperMarketError::Venue(code)));
+                assert_eq!(parse_closed_candles(&instrument()?, Timeframe::M1, at(5)?, 200, &body),
+                    Err(PaperMarketError::Venue(code)));
+            }
+            let missing_result = serde_json::to_vec(&json!({"retCode": code, "retMsg": "secret upstream detail"}))?;
+            let error = parse_instrument("BTCUSDT", 200, &missing_result).err().ok_or("expected venue error")?;
+            assert_eq!(error, PaperMarketError::Venue(code));
+            assert!(!format!("{error} {error:?}").contains("secret upstream detail"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_status_and_success_fields_are_fatal_not_collapsed() -> TestResult {
+        for body in [
+            br#"{"retCode":0,"retCode":10006,"result":{}}"#.as_slice(),
+            br#"{"retCode":10006,"retCode":10006,"result":null}"#.as_slice(),
+            br#"{"retCode":0,"result":{},"result":{}}"#.as_slice(),
+            br#"{"retCode":0,"result":{"category":"linear","category":"linear","symbol":"BTCUSDT","list":[]},"time":1767225600000}"#.as_slice(),
+            br#"{"retCode":0,"result":{"category":"linear","symbol":"BTCUSDT","list":[],"list":[]},"time":1767225600000}"#.as_slice(),
+            br#"{"retCode":0,"result":{"category":"linear","symbol":"BTCUSDT","list":[]},"time":1767225600000,"time":1767225600000}"#.as_slice(),
+        ] {
+            let error = parse_closed_candles(&instrument()?, Timeframe::M1, at(0)?, 200, body)
+                .err().ok_or("duplicate fields accepted")?;
+            assert!(matches!(error, PaperMarketError::MalformedResponse {
+                category: ResponseDecodeCategory::Data, ..
+            }));
+            assert!(!error.is_retryable());
+        }
+        let original = serde_json::to_string(&metadata())?;
+        let duplicate_filter = original.replacen("\"qtyStep\":\"0.001\"",
+            "\"qtyStep\":\"0.001\",\"qtyStep\":\"0.001\"", 1);
+        assert_ne!(original, duplicate_filter);
+        let error = parse_instrument("BTCUSDT", 200, duplicate_filter.as_bytes())
+            .err().ok_or("duplicate filter accepted")?;
+        assert!(matches!(error, PaperMarketError::MalformedResponse {
+            phase: ResponseDecodePhase::SuccessSchema,
+            category: ResponseDecodeCategory::Data, ..
+        }));
+        assert!(!error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn valid_json_with_invalid_status_or_success_schema_is_fatal() -> TestResult {
+        for body in [
+            b"{}".as_slice(),
+            br#"{"retCode":"0"}"#.as_slice(),
+            br#"{"retCode":0.0}"#.as_slice(),
+            br#"{"retCode":true}"#.as_slice(),
+            b"[]".as_slice(),
+            b"null".as_slice(),
+        ] {
+            let error = parse_instrument("BTCUSDT", 200, body).err().ok_or("invalid envelope accepted")?;
+            assert!(matches!(error, PaperMarketError::MalformedResponse {
+                phase: ResponseDecodePhase::Envelope,
+                category: ResponseDecodeCategory::Data, ..
+            }));
+            assert!(!error.is_retryable());
+        }
+        for body in [
+            br#"{"retCode":0}"#.as_slice(),
+            br#"{"retCode":0,"result":null}"#.as_slice(),
+            br#"{"retCode":0,"result":{}}"#.as_slice(),
+            br#"{"retCode":0,"result":{"category":"linear","symbol":"BTCUSDT","list":[["0","1"]]},"time":1767225600000}"#.as_slice(),
+            br#"{"retCode":0,"result":{"category":"linear","symbol":"BTCUSDT","list":[["0",1,"1","1","1","1","1"]]},"time":1767225600000}"#.as_slice(),
+            br#"{"retCode":0,"result":{"category":"linear","symbol":"BTCUSDT","list":[]},"time":"secret timestamp"}"#.as_slice(),
+        ] {
+            let error = parse_closed_candles(&instrument()?, Timeframe::M1, at(0)?, 200, body)
+                .err().ok_or("invalid success schema accepted")?;
+            assert!(matches!(error, PaperMarketError::MalformedResponse {
+                phase: ResponseDecodePhase::SuccessSchema,
+                category: ResponseDecodeCategory::Data, ..
+            }));
+            assert!(!error.is_retryable());
+            assert!(!format!("{error} {error:?}").contains("secret timestamp"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_json_has_only_safe_structural_diagnostics() -> TestResult {
+        for body in [
+            b"".as_slice(),
+            b"<html>secret-token user:password api.example/private</html>".as_slice(),
+            b"{\n\"retCode\":0,\"retMsg\":\"secret-token\",\"result\":".as_slice(),
+            b"{\"retCode\":0,\"retMsg\":\"secret-token\"} trailing".as_slice(),
+        ] {
+            let error = parse_instrument("BTCUSDT", 201, body).err().ok_or("invalid JSON accepted")?;
+            assert!(matches!(error, PaperMarketError::MalformedResponse {
+                status: 201,
+                phase: ResponseDecodePhase::Envelope,
+                category: ResponseDecodeCategory::Syntax | ResponseDecodeCategory::Eof,
+                body_bytes,
+                ..
+            } if body_bytes == body.len()));
+            assert!(error.is_retryable());
+            let diagnostic = format!("{error} {error:?}");
+            for sensitive in ["secret-token", "user:password", "api.example", "retMsg", "<html>"] {
+                assert!(!diagnostic.contains(sensitive));
+            }
+            assert!(diagnostic.contains("line="));
+            assert!(diagnostic.contains("column="));
+            assert!(diagnostic.contains("bytes="));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retry_classification_is_an_explicit_narrow_allowlist() {
+        assert!(PaperMarketError::Transport.is_retryable());
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(PaperMarketError::HttpStatus(status).is_retryable());
+        }
+        for status in [200, 301, 302, 400, 401, 403, 404, 409, 422, 501, 505] {
+            assert!(!PaperMarketError::HttpStatus(status).is_retryable());
+        }
+        for code in [10000, 10006, 10016] {
+            assert!(PaperMarketError::Venue(code).is_retryable());
+        }
+        for code in [0, 10001, 10002, 10003, 10009, 10024, 10029] {
+            assert!(!PaperMarketError::Venue(code).is_retryable());
+        }
+        for error in [
+            PaperMarketError::Configuration,
+            PaperMarketError::ResponseTooLarge,
+            PaperMarketError::InvalidSymbol,
+            PaperMarketError::UnsupportedInstrument,
+            PaperMarketError::InvalidMetadata,
+            PaperMarketError::InvalidCandles,
+            PaperMarketError::InvalidTime,
+            PaperMarketError::ClockSkew,
+            PaperMarketError::DuplicateCandle,
+            PaperMarketError::CandleGap,
+            PaperMarketError::InvalidLimit,
+            PaperMarketError::InvalidRetryAfter(429),
+            PaperMarketError::InvalidRetryAfter(503),
+        ] {
+            assert!(!error.is_retryable());
+            assert_eq!(error.suggested_retry_delay(), None);
+        }
+    }
+
+    #[test]
+    fn retry_after_supports_seconds_and_preferred_http_dates_without_shortening() -> TestResult {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let now = at(0)?;
+        let mut headers = HeaderMap::new();
+        assert_eq!(http_status_error(503, &headers, now), PaperMarketError::HttpStatus(503));
+        for (value, expected) in [("0", 0), ("17", 17), (" 17\t", 17), ("18446744073709551615", u64::MAX)] {
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(value)?);
+            for status in [429, 503] {
+                let error = http_status_error(status, &headers, now);
+                assert_eq!(error, PaperMarketError::HttpRetryAfter { status, delay: Duration::from_secs(expected) });
+                assert!(error.is_retryable());
+                assert_eq!(error.suggested_retry_delay(), Some(Duration::from_secs(expected)));
+            }
+        }
+        for (offset, expected) in [(-30, 0), (0, 0), (30, 30)] {
+            let date = now.checked_add_signed(chrono::Duration::seconds(offset)).ok_or("fixture date")?;
+            let value = date.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(&value)?);
+            assert_eq!(http_status_error(429, &headers, now).suggested_retry_delay(), Some(Duration::from_secs(expected)));
+        }
+        // A subsecond current time must not round a future HTTP-date down.
+        let future = now.checked_add_signed(chrono::Duration::seconds(1)).ok_or("fixture date")?;
+        let value = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(&value)?);
+        let fractional_now = now.checked_add_signed(chrono::Duration::milliseconds(250)).ok_or("fixture date")?;
+        assert_eq!(http_status_error(503, &headers, fractional_now).suggested_retry_delay(), Some(Duration::from_millis(750)));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_or_ambiguous_retry_after_is_fatal_and_redacted() -> TestResult {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let mut headers = HeaderMap::new();
+        for value in ["", "-1", "+1", "1.5", "1, 2", "18446744073709551616", "secret-token",
+            "Sunday, 06-Nov-94 08:49:37 GMT", "Thu, 01 Jan 2026 00:00:00 +0000"] {
+            headers.insert(RETRY_AFTER, HeaderValue::from_str(value)?);
+            for status in [429, 503] {
+                let error = http_status_error(status, &headers, at(0)?);
+                assert_eq!(error, PaperMarketError::InvalidRetryAfter(status), "accepted unsupported retry hint");
+                assert!(!error.is_retryable());
+                assert_eq!(error.suggested_retry_delay(), None);
+                assert!(!format!("{error} {error:?}").contains("secret-token"));
+            }
+        }
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        headers.append(RETRY_AFTER, HeaderValue::from_static("1"));
+        assert_eq!(http_status_error(429, &headers, at(0)?), PaperMarketError::InvalidRetryAfter(429));
+        headers.insert(RETRY_AFTER, HeaderValue::from_bytes(&[0xff])?);
+        assert_eq!(http_status_error(503, &headers, at(0)?), PaperMarketError::InvalidRetryAfter(503));
+        // Retry hints never make a forbidden or redirect response retryable.
+        assert_eq!(http_status_error(403, &headers, at(0)?), PaperMarketError::HttpStatus(403));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_preserves_actual_success_status_and_retry_hints_single_attempt() -> TestResult {
+        let server = MockServer::start().await;
+        let market = PublicPaperMarket::local(server.uri())?;
+        Mock::given(method("GET"))
+            .and(path("/v5/market/instruments-info"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server).await;
+        let error = market.instrument("BTCUSDT").await.err().ok_or("empty 204 accepted")?;
+        assert!(matches!(error, PaperMarketError::MalformedResponse {
+            status: 204,
+            phase: ResponseDecodePhase::Envelope,
+            category: ResponseDecodeCategory::Eof,
+            body_bytes: 0,
+            ..
+        }));
+        server.reset().await;
+        for status in [429, 503] {
+            Mock::given(method("GET"))
+                .and(path("/v5/market/instruments-info"))
+                .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "13")
+                    .set_body_string("secret-token upstream payload"))
+                .expect(1)
+                .mount(&server).await;
+            assert_eq!(market.instrument("BTCUSDT").await,
+                Err(PaperMarketError::HttpRetryAfter { status, delay: Duration::from_secs(13) }));
+            assert_eq!(server.received_requests().await.ok_or("request capture")?.len(), 1);
+            server.reset().await;
+        }
         Ok(())
     }
 

@@ -7,7 +7,13 @@
 pub mod broker;
 pub mod engine;
 pub mod market;
+pub mod portfolio;
+pub mod book;
+pub mod multi_portfolio;
 
 pub use broker::*;
 pub use engine::*;
 pub use market::*;
+pub use portfolio::*;
+pub use book::*;
+pub use multi_portfolio::*;

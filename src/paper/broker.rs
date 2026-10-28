@@ -4,6 +4,9 @@
 //! priority, order books, and partial fills are not modeled. Fees are explicit
 //! assumptions. An adverse gap can exceed the planned risk or exhaust equity;
 //! losses are never clipped. End-of-data never liquidates an open position.
+//! Leverage changes initial-margin affordability only, never the approved risk
+//! budget or the price-movement `PnL` formula. There is no maintenance-margin or
+//! isolated-liquidation model; estimated exit-fee reserves are not guarantees.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -32,6 +35,9 @@ pub struct PaperConfig {
     max_notional_fraction: Decimal,
     #[serde(with = "crate::decimal_codec::required")]
     min_net_rr: Decimal,
+    // Preserve the exact v1 serialization when the legacy 1x default is used.
+    #[serde(skip_serializing_if = "is_one")]
+    leverage: u32,
 }
 
 impl PaperConfig {
@@ -75,7 +81,30 @@ impl PaperConfig {
             stop_slippage_bps,
             max_notional_fraction,
             min_net_rr,
+            leverage: 1,
         })
+    }
+
+    /// Selects initial-margin leverage without changing risk-approved quantity.
+    ///
+    /// This is an affordability assumption, not an exchange margin, funding, or
+    /// liquidation model. The default remains one for legacy session replay.
+    ///
+    /// # Errors
+    ///
+    /// Rejects leverage outside `1..=10`.
+    pub fn with_leverage(mut self, leverage: u32) -> Result<Self, PaperError> {
+        if !(1..=10).contains(&leverage) {
+            return Err(PaperError::InvalidConfig("leverage must be in 1..=10"));
+        }
+        self.leverage = leverage;
+        Ok(self)
+    }
+
+    /// Initial notional divided by this factor determines simulated margin.
+    #[must_use]
+    pub const fn leverage(&self) -> u32 {
+        self.leverage
     }
 
     /// Initial quote-currency paper cash, defaulting to 100.
@@ -96,7 +125,10 @@ impl PaperConfig {
         self.stop_slippage_bps
     }
 
-    /// Maximum entry notional plus entry fee divided by available cash.
+    /// Maximum fraction of cash available for entry capital and cost reserves.
+    ///
+    /// At 1x this retains the legacy notional-plus-entry-fee cap. Above 1x it
+    /// caps initial margin plus entry and estimated protective-exit fees.
     #[must_use]
     pub const fn max_notional_fraction(&self) -> Decimal {
         self.max_notional_fraction
@@ -117,8 +149,15 @@ impl Default for PaperConfig {
             stop_slippage_bps: Decimal::TWO,
             max_notional_fraction: Decimal::ONE,
             min_net_rr: Decimal::TWO,
+            leverage: 1,
         }
     }
+}
+
+// Serde's skip_serializing_if callback requires a shared reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_one(value: &u32) -> bool {
+    *value == 1
 }
 
 /// Deterministic broker validation or arithmetic failure.
@@ -136,7 +175,7 @@ pub enum PaperError {
     /// No valid step-aligned minimum order remains after conservative sizing.
     #[error("paper order is below minimum quantity or notional")]
     MinimumOrder,
-    /// There is no positive unleveraged cash budget.
+    /// There is no positive cash budget for initial margin and execution costs.
     #[error("paper cash is insufficient for another entry")]
     InsufficientBalance,
     /// The approval's target does not meet net RR after assumed execution costs.
@@ -328,11 +367,14 @@ impl PaperOrder {
     }
 }
 
-/// Single-instrument, unleveraged, deterministic simulation state.
+/// Single-exposure, deterministic simulation state with shared cash accounting.
 ///
 /// Mutating methods stage all changes, so any error preserves the old state.
 /// An exact latest-candle duplicate and an exact accepted-approval replay are
 /// idempotent. Older candles, gaps, and conflicting duplicates fail closed.
+/// Instrument selection may change only while completely flat; the caller must
+/// supply instruments using the same account quote currency and synchronized
+/// closed candles. Leverage models initial margin only, not liquidation.
 #[derive(Clone, Debug)]
 pub struct PaperBroker {
     config: PaperConfig,
@@ -348,6 +390,97 @@ pub struct PaperBroker {
 }
 
 impl PaperBroker {
+    /// Funds a one-shot v3 execution sleeve from an already account-capped budget.
+    /// The returned allocation, not the sizing budget, is its actual cash seed.
+    /// Existing v1/v2 construction, sizing and serialized accounting are unchanged.
+    pub(crate) fn allocate_order(
+        config: PaperConfig,
+        spec: InstrumentRiskSpec,
+        min_notional: Decimal,
+        plan: RiskPlan,
+        signal_candle: &Candle,
+        cash_budget: Decimal,
+    ) -> Result<(Self, Decimal), PaperError> {
+        if cash_budget <= Decimal::ZERO {
+            return Err(PaperError::InsufficientBalance);
+        }
+        let sizing_config = PaperConfig::new(
+            cash_budget, config.fee_rate, config.stop_slippage_bps,
+            Decimal::ONE, config.min_net_rr,
+        )?.with_leverage(config.leverage)?;
+        let mut sleeve = Self::new(sizing_config, spec, min_notional)?;
+        sleeve.select_instrument(sleeve.spec.clone(), min_notional, signal_candle)?;
+        sleeve.submit(plan)?;
+        let mut order = sleeve.pending.take().ok_or(PaperError::Arithmetic)?;
+        let stop = sleeve.stop_price(order.plan.stop_loss_price(), order.plan.direction())?;
+        // RiskManager reserves planned_loss, which can be below risk_budget
+        // after step rounding. All execution costs must fit that reservation.
+        let unit_risk = sleeve.stop_risk(&order.plan, Decimal::ONE, stop)?;
+        let unit_capital = sleeve.allocation_capital(&order.plan, Decimal::ONE, true)?;
+        order.quantity = floor_step(order.quantity
+            .min(div(order.plan.planned_loss(), unit_risk)?)
+            .min(div(cash_budget, unit_capital)?), sleeve.spec.quantity_step())?;
+        if sleeve.stop_risk(&order.plan, order.quantity, stop)? > order.plan.planned_loss()
+            || sleeve.allocation_capital(&order.plan, order.quantity, true)? > cash_budget
+        {
+            order.quantity = sub(order.quantity, sleeve.spec.quantity_step())?;
+        }
+        if order.quantity <= Decimal::ZERO || order.quantity < sleeve.spec.minimum_quantity()
+            || sleeve.notional(order.plan.entry_price(), order.quantity)? < min_notional
+        {
+            return Err(PaperError::MinimumOrder);
+        }
+        let actual_risk = sleeve.stop_risk(&order.plan, order.quantity, stop)?;
+        let allocation = sleeve.allocation_capital(&order.plan, order.quantity, true)?;
+        if order.quantity > order.plan.quantity() || actual_risk > order.plan.planned_loss()
+            || allocation > cash_budget || allocation <= Decimal::ZERO
+        {
+            return Err(PaperError::Arithmetic);
+        }
+        order.entry_fee = sleeve.fee(order.plan.entry_price(), order.quantity)?;
+        let reward = sub(sub(sleeve.gross_pnl(&order, order.plan.take_profit_price())?, order.entry_fee)?,
+            sleeve.fee(order.plan.take_profit_price(), order.quantity)?)?;
+        if reward < mul(actual_risk, config.min_net_rr)? {
+            return Err(PaperError::NetRiskReward);
+        }
+        // No fill or accounting event has happened: rebasing this pristine
+        // pending sleeve transfers exactly the capital supplied by its owner.
+        sleeve.config = PaperConfig::new(allocation, config.fee_rate,
+            config.stop_slippage_bps, Decimal::ONE, config.min_net_rr)?
+            .with_leverage(config.leverage)?;
+        sleeve.metrics.initial_balance = allocation;
+        sleeve.metrics.balance = allocation;
+        sleeve.metrics.equity = allocation;
+        sleeve.metrics.pending = Some(order.snapshot());
+        sleeve.pending = Some(order);
+        Ok((sleeve, allocation))
+    }
+
+    /// Remaining initial margin and fee reserve; entry fees already paid are
+    /// excluded for open positions. This is not a liquidation-price model.
+    pub(crate) fn reserved_capital(&self) -> Result<Decimal, PaperError> {
+        if let Some(order) = &self.pending {
+            self.allocation_capital(&order.plan, order.quantity, true)
+        } else if let Some(order) = &self.position {
+            self.allocation_capital(&order.plan, order.quantity, false)
+        } else {
+            Ok(Decimal::ZERO)
+        }
+    }
+
+    fn allocation_capital(&self, plan: &RiskPlan, quantity: Decimal, pending: bool) -> Result<Decimal, PaperError> {
+        let stop = self.stop_price(plan.stop_loss_price(), plan.direction())?;
+        let exit_fee = self.fee(stop, quantity)?.max(self.fee(plan.take_profit_price(), quantity)?);
+        let entry_fee = if pending { self.fee(plan.entry_price(), quantity)? } else { Decimal::ZERO };
+        let mut margin = self.initial_margin(plan.entry_price(), quantity)?;
+        // A rounded division must never allocate less cash than the notional
+        // requires. This upward reserve applies only to new v3 sleeves.
+        if mul(margin, Decimal::from(self.config.leverage))? < self.notional(plan.entry_price(), quantity)? {
+            margin = add(margin, Decimal::new(1, margin.scale()))?;
+        }
+        add(margin, add(entry_fee, exit_fee)?)
+    }
+
     /// Starts a fresh broker, without credentials or any exchange transport.
     ///
     /// # Errors
@@ -399,6 +532,88 @@ impl PaperBroker {
         &self.spec
     }
 
+    /// Selects another contract while preserving the shared account and history.
+    ///
+    /// The supplied final candle becomes the execution cursor, so a subsequent
+    /// approval cannot fill on the already observed candle. A different symbol
+    /// may use the same close time as the previous symbol. This method does not
+    /// reset cash, fees, trade counters, or accepted-approval tombstones.
+    ///
+    /// The caller must ensure both contracts share the account quote currency.
+    /// It must also validate each independent symbol's candle continuity before
+    /// selecting it; a flat broker does not reconstruct the inactive series.
+    ///
+    /// # Errors
+    ///
+    /// Rejects occupied state, invalid minimum notional, exchange/market changes,
+    /// mismatched/nonfinal/misaligned candles, timeframe changes, regressions, or
+    /// a conflicting same-symbol duplicate. Errors leave all state unchanged.
+    pub fn select_instrument(
+        &mut self,
+        spec: InstrumentRiskSpec,
+        min_notional: Decimal,
+        last_closed_candle: &Candle,
+    ) -> Result<(), PaperError> {
+        if !self.is_flat() {
+            return Err(PaperError::Busy);
+        }
+        if min_notional < Decimal::ZERO {
+            return Err(PaperError::InvalidConfig("minimum notional cannot be negative"));
+        }
+        if spec.instrument().exchange != self.spec.instrument().exchange
+            || spec.instrument().market != self.spec.instrument().market
+        {
+            return Err(PaperError::InvalidConfig("instrument selection must stay in one venue and market"));
+        }
+        if last_closed_candle.instrument() != spec.instrument()
+            || !last_closed_candle.is_closed()
+            || last_closed_candle.close_time().signed_duration_since(last_closed_candle.open_time())
+                != last_closed_candle.timeframe().duration()
+            || last_closed_candle.open_time().timestamp_subsec_nanos() != 0
+            || last_closed_candle.open_time().timestamp()
+                .rem_euclid(last_closed_candle.timeframe().duration().num_seconds()) != 0
+        {
+            return Err(PaperError::InvalidCandle("instrument selection needs its final aligned candle"));
+        }
+        if let Some(previous) = &self.last_candle {
+            if previous.timeframe() != last_closed_candle.timeframe() {
+                return Err(PaperError::InvalidCandle("timeframe changed"));
+            }
+            if last_closed_candle.close_time() < previous.close_time() {
+                return Err(PaperError::OutOfOrder);
+            }
+            if previous.instrument() == last_closed_candle.instrument()
+                && previous.open_time() == last_closed_candle.open_time()
+                && previous != last_closed_candle
+            {
+                return Err(PaperError::ConflictingDuplicate);
+            }
+        }
+        self.spec = spec;
+        self.min_notional = min_notional;
+        self.last_candle = Some(last_closed_candle.clone());
+        Ok(())
+    }
+
+    /// Returns notional divided by configured leverage, excluding all fee reserves.
+    ///
+    /// This reports initial-margin accounting only and does not estimate the
+    /// exchange's maintenance margin or liquidation price.
+    ///
+    /// # Errors
+    ///
+    /// Rejects nonpositive prices, negative quantities, or arithmetic overflow.
+    pub fn initial_margin(&self, price: Decimal, quantity: Decimal) -> Result<Decimal, PaperError> {
+        if price <= Decimal::ZERO || quantity < Decimal::ZERO {
+            return Err(PaperError::InvalidApproval("invalid margin-report price or quantity"));
+        }
+        let margin = div(self.notional(price, quantity)?, Decimal::from(self.config.leverage))?;
+        if quantity > Decimal::ZERO && margin <= Decimal::ZERO {
+            return Err(PaperError::Arithmetic);
+        }
+        Ok(margin)
+    }
+
     /// Whether neither a pending entry nor an open position is owned.
     #[must_use]
     pub const fn is_flat(&self) -> bool {
@@ -425,7 +640,9 @@ impl PaperBroker {
 
     /// Rests a risk-approved limit; submission itself can never fill an order.
     ///
-    /// Quantity is reduced for assumed fees/slippage and a one-times cash cap.
+    /// Quantity is reduced for fees/slippage and the configured entry-capital cap.
+    /// Leverage changes affordability only; the original quantity and complete
+    /// fee-inclusive stop-risk budget remain ceilings, never multiplied by leverage.
     /// The original external risk reservation must remain until cancellation
     /// or complete close, even when this simulator selects a smaller quantity.
     ///
@@ -558,10 +775,15 @@ impl PaperBroker {
             return Err(PaperError::NetRiskReward);
         }
         let cash = mul(self.metrics.balance, self.config.max_notional_fraction)?;
-        let unit_cash = add(
-            mul(plan.entry_price(), self.spec.quote_value_per_price_unit())?,
-            entry_fee,
-        )?;
+        let unit_cash = if self.config.leverage == 1 {
+            // Keep the v1 arithmetic path byte-for-byte equivalent for replay.
+            add(
+                mul(plan.entry_price(), self.spec.quote_value_per_price_unit())?,
+                entry_fee,
+            )?
+        } else {
+            self.entry_capital(plan, Decimal::ONE, stop)?
+        };
         let quantity = plan
             .quantity()
             .min(div(plan.risk_budget(), risk)?)
@@ -607,13 +829,37 @@ impl PaperBroker {
         stop: Decimal,
         cash: Decimal,
     ) -> Result<bool, PaperError> {
-        let actual_cash = add(
-            self.notional(plan.entry_price(), quantity)?,
-            self.fee(plan.entry_price(), quantity)?,
-        )?;
+        let capital_fits = if self.config.leverage == 1 {
+            self.entry_capital(plan, quantity, stop)? <= cash
+        } else {
+            let costs = add(
+                self.fee(plan.entry_price(), quantity)?,
+                self.fee(stop, quantity)?.max(self.fee(plan.take_profit_price(), quantity)?),
+            )?;
+            // Do not approve a last-digit overrun hidden by division rounding
+            // in the candidate's initial-margin estimate.
+            costs <= cash && self.notional(plan.entry_price(), quantity)?
+                <= mul(sub(cash, costs)?, Decimal::from(self.config.leverage))?
+        };
         Ok(quantity <= plan.quantity()
-            && actual_cash <= cash
+            && capital_fits
             && self.stop_risk(plan, quantity, stop)? <= plan.risk_budget())
+    }
+
+    fn entry_capital(
+        &self,
+        plan: &RiskPlan,
+        quantity: Decimal,
+        stop: Decimal,
+    ) -> Result<Decimal, PaperError> {
+        let entry_fee = self.fee(plan.entry_price(), quantity)?;
+        if self.config.leverage == 1 {
+            return add(self.notional(plan.entry_price(), quantity)?, entry_fee);
+        }
+        // Reserve the greater planned exit fee, not just the cheaper stop fee.
+        // Adverse gaps may still exceed this estimate; there is no loss clipping.
+        let exit_fee = self.fee(stop, quantity)?.max(self.fee(plan.take_profit_price(), quantity)?);
+        add(self.initial_margin(plan.entry_price(), quantity)?, add(entry_fee, exit_fee)?)
     }
 
     fn stop_risk(
@@ -871,7 +1117,7 @@ fn div(left: Decimal, right: Decimal) -> Result<Decimal, PaperError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{error::Error, io};
 
     use super::*;
@@ -898,9 +1144,13 @@ mod tests {
     }
 
     fn intent(direction: Direction) -> Result<TradeIntent, Box<dyn Error>> {
+        intent_with_offset(direction, 0)
+    }
+
+    pub(crate) fn intent_with_offset(direction: Direction, offset: i64) -> Result<TradeIntent, Box<dyn Error>> {
         let bullish = direction == Direction::Bullish;
         let series = instrument(Exchange::Binance)?;
-        let price = |value: i64| Decimal::new(if bullish { value } else { 200 - value }, 0);
+        let price = |value: i64| Decimal::new(offset + if bullish { value } else { 200 - value }, 0);
         let shift = MarketStructureShift::new(MarketStructureShiftInput {
             id: Uuid::from_u128(12),
             instrument: series.clone(),
@@ -1057,6 +1307,34 @@ mod tests {
             .as_ref()
             .or(snapshot.position.as_ref())
             .ok_or_else(|| io::Error::other("missing paper order"))
+    }
+
+    fn high_price_approval() -> Result<RiskPlan, Box<dyn Error>> {
+        let mut manager = RiskManager::new(RiskConfig::default());
+        manager.register_instrument_spec(spec()?)?;
+        manager.start_trading_day(Decimal::from(100), Decimal::from(100), at(299)?, false)?;
+        let intent = intent_with_offset(Direction::Bullish, 10_000)?;
+        let target = LiquidityTarget::new(
+            Uuid::from_u128(14), instrument(Exchange::Binance)?, LiquiditySide::BuySide,
+            Decimal::from(10_500), at(240)?,
+        )?;
+        match manager.assess_trade(&intent, &target, at(300)?)? {
+            TradeAssessment::Approved(plan) => Ok(*plan),
+            TradeAssessment::Replay { .. } => Err(io::Error::other("expected fresh high-price approval").into()),
+        }
+    }
+
+    fn ethereum_spec() -> Result<InstrumentRiskSpec, Box<dyn Error>> {
+        Ok(InstrumentRiskSpec::new(
+            crate::InstrumentId::new(Exchange::Binance, crate::MarketKind::LinearPerpetual, "ETHUSDT", "ETH-USDT-PERP")?,
+            Decimal::new(1, 1), Decimal::new(1, 3), Decimal::new(1, 3), None, Decimal::ONE,
+        )?)
+    }
+
+    fn ethereum_candle(start: i64) -> Result<Candle, Box<dyn Error>> {
+        let mut value = serde_json::to_value(candle(start, 103, 104, 101, 103)?)?;
+        value["instrument"] = serde_json::to_value(ethereum_spec()?.instrument())?;
+        Ok(serde_json::from_value(value)?)
     }
 
     #[test]
@@ -1387,6 +1665,217 @@ mod tests {
             broker.advance(&wrong_width),
             Err(PaperError::InvalidCandle(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn leverage_configuration_preserves_legacy_json_and_rejects_unsupported_values() -> TestResult {
+        let original = PaperConfig::default();
+        assert_eq!(original.leverage(), 1);
+        assert_eq!(serde_json::to_value(original)?, serde_json::json!({
+            "initial_balance": "100", "fee_rate": "0.0006", "stop_slippage_bps": "2",
+            "max_notional_fraction": "1", "min_net_rr": "2"
+        }));
+        assert_eq!(serde_json::to_string(&original)?, serde_json::to_string(&original.with_leverage(1)?)?);
+        assert_eq!(serde_json::to_value(original.with_leverage(10)?)?["leverage"], 10);
+        for leverage in [0, 11, u32::MAX] {
+            assert!(matches!(original.with_leverage(leverage), Err(PaperError::InvalidConfig(_))));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v3_allocated_margin_rounds_up_at_decimal_precision_without_changing_legacy_report() -> TestResult {
+        let config = PaperConfig::new(Decimal::from(100), Decimal::ZERO, Decimal::ZERO,
+            Decimal::ONE, Decimal::TWO)?.with_leverage(7)?;
+        let broker = PaperBroker::new(config, spec()?, Decimal::ZERO)?;
+        let plan = approval(Direction::Bullish)?;
+        let quantity = Decimal::new(2, 28);
+        let notional = broker.notional(plan.entry_price(), quantity)?;
+        let legacy = broker.initial_margin(plan.entry_price(), quantity)?;
+        assert!(mul(legacy, Decimal::from(7))? < notional);
+        let funded = broker.allocation_capital(&plan, quantity, true)?;
+        assert!(mul(funded, Decimal::from(7))? >= notional);
+        assert!(funded > legacy);
+        assert_eq!(broker.initial_margin(plan.entry_price(), quantity)?, legacy);
+        Ok(())
+    }
+
+    #[test]
+    fn leverage_changes_margin_affordability_but_never_the_one_percent_risk_budget() -> TestResult {
+        let plan = high_price_approval()?;
+        assert_eq!(plan.risk_budget(), Decimal::ONE);
+        let mut unleveraged = broker()?;
+        let mut leveraged = PaperBroker::new(PaperConfig::default().with_leverage(10)?, spec()?, Decimal::from(5))?;
+        unleveraged.submit(plan.clone())?;
+        leveraged.submit(plan.clone())?;
+        let unleveraged_snapshot = unleveraged.snapshot();
+        let leveraged_snapshot = leveraged.snapshot();
+        let unleveraged_quantity = order(&unleveraged_snapshot)?.quantity;
+        let sized = order(&leveraged_snapshot)?;
+        assert!(sized.quantity > unleveraged_quantity);
+        assert!(sized.quantity <= plan.quantity());
+        assert!(leveraged.notional(sized.entry_price, sized.quantity)? > Decimal::from(100));
+        let stop = leveraged.stop_price(plan.stop_loss_price(), plan.direction())?;
+        assert!(leveraged.stop_risk(&plan, sized.quantity, stop)? <= Decimal::ONE);
+        assert!(leveraged.entry_capital(&plan, sized.quantity, stop)? <= Decimal::from(100));
+        assert_eq!(sized.quantity.checked_rem(spec()?.quantity_step()), Some(Decimal::ZERO));
+        Ok(())
+    }
+
+    #[test]
+    fn leveraged_cash_cap_reserves_entry_and_larger_protective_exit_fee() -> TestResult {
+        // A higher-equity approval deliberately makes the broker's independent
+        // 100-cash margin check bind first, rather than its external risk ceiling.
+        let plan = approval_with(Direction::Bullish, Decimal::from(10_000), Decimal::from(112), &spec()?)?;
+        let mut broker = PaperBroker::new(PaperConfig::default().with_leverage(10)?, spec()?, Decimal::ZERO)?;
+        broker.submit(plan.clone())?;
+        let snapshot = broker.snapshot();
+        let sized = order(&snapshot)?;
+        let stop = broker.stop_price(plan.stop_loss_price(), plan.direction())?;
+        let margin = broker.initial_margin(sized.entry_price, sized.quantity)?;
+        let entry_fee = broker.fee(sized.entry_price, sized.quantity)?;
+        let exit_fee = broker.fee(plan.take_profit_price(), sized.quantity)?.max(broker.fee(stop, sized.quantity)?);
+        assert!(add(margin, add(entry_fee, exit_fee)?)? <= Decimal::from(100));
+        let next = add(sized.quantity, spec()?.quantity_step())?;
+        assert!(!broker.quantity_fits(&plan, next, stop, Decimal::from(100))?);
+        assert!(broker.notional(sized.entry_price, sized.quantity)? < Decimal::from(1000));
+        Ok(())
+    }
+
+    #[test]
+    fn ten_times_margin_without_costs_still_does_not_multiply_approved_quantity() -> TestResult {
+        let config = PaperConfig::new(Decimal::from(100), Decimal::ZERO, Decimal::ZERO, Decimal::ONE, Decimal::TWO)?;
+        let plan = high_price_approval()?;
+        let mut broker = PaperBroker::new(config.with_leverage(10)?, spec()?, Decimal::ZERO)?;
+        broker.submit(plan.clone())?;
+        let snapshot = broker.snapshot();
+        let sized = order(&snapshot)?;
+        assert_eq!(sized.quantity, Decimal::new(98, 3));
+        assert!(sized.quantity < plan.quantity());
+        assert!(broker.initial_margin(sized.entry_price, sized.quantity)? <= Decimal::from(100));
+        assert!(broker.stop_risk(&plan, sized.quantity, plan.stop_loss_price())? <= Decimal::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn leveraged_profit_is_price_difference_times_quantity_without_extra_multiplier() -> TestResult {
+        let plan = high_price_approval()?;
+        let entry = plan.entry_price();
+        let target = plan.take_profit_price();
+        let mut broker = PaperBroker::new(PaperConfig::default().with_leverage(10)?, spec()?, Decimal::from(5))?;
+        broker.submit(plan)?;
+        let snapshot = broker.snapshot();
+        let quantity = order(&snapshot)?.quantity;
+        let expected_gross = mul(sub(target, entry)?, quantity)?;
+        let expected_fees = add(broker.fee(entry, quantity)?, broker.fee(target, quantity)?)?;
+        let fill = broker.advance(&candle(300, 10_103, 10_104, 10_101, 10_102)?)?;
+        assert!(matches!(fill.as_slice(), [PaperEvent::EntryFilled { .. }]));
+        let close = broker.advance(&candle(360, 10_103, 10_501, 10_102, 10_500)?)?;
+        let [PaperEvent::PositionClosed { gross_pnl, net_pnl, .. }] = close.as_slice() else {
+            return Err(io::Error::other("expected leveraged target exit").into());
+        };
+        assert_eq!(*gross_pnl, expected_gross);
+        assert_eq!(*net_pnl, sub(expected_gross, expected_fees)?);
+        assert_eq!(broker.snapshot().balance, add(Decimal::from(100), *net_pnl)?);
+        assert_eq!(broker.snapshot().fees_paid, expected_fees);
+        Ok(())
+    }
+
+    #[test]
+    fn leverage_does_not_bypass_minimum_orders_or_insufficient_cash() -> TestResult {
+        let config = PaperConfig::default().with_leverage(10)?;
+        let mut minimum = PaperBroker::new(config, spec()?, Decimal::from(1001))?;
+        assert_eq!(minimum.submit(high_price_approval()?), Err(PaperError::MinimumOrder));
+        assert!(minimum.is_flat());
+        let mut empty = PaperBroker::new(config, spec()?, Decimal::ZERO)?;
+        empty.metrics.balance = Decimal::ZERO;
+        assert_eq!(empty.submit(high_price_approval()?), Err(PaperError::InsufficientBalance));
+        assert!(empty.is_flat());
+        assert!(matches!(empty.initial_margin(Decimal::ZERO, Decimal::ONE), Err(PaperError::InvalidApproval(_))));
+        assert!(matches!(empty.initial_margin(Decimal::ONE, -Decimal::ONE), Err(PaperError::InvalidApproval(_))));
+        assert_eq!(empty.initial_margin(Decimal::ONE, Decimal::ZERO)?, Decimal::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_one_times_simulation_retains_all_legacy_events_and_snapshot_bytes() -> TestResult {
+        let mut original = broker()?;
+        let mut explicit = PaperBroker::new(PaperConfig::default().with_leverage(1)?, spec()?, Decimal::from(5))?;
+        let plan = approval(Direction::Bullish)?;
+        assert_eq!(original.submit(plan.clone())?, explicit.submit(plan)?);
+        for bar in [candle(300, 103, 104, 101, 103)?, candle(360, 103, 113, 102, 112)?] {
+            assert_eq!(original.advance(&bar)?, explicit.advance(&bar)?);
+            assert_eq!(serde_json::to_vec(&original.snapshot())?, serde_json::to_vec(&explicit.snapshot())?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn switching_at_same_close_preserves_cash_metrics_and_completed_tombstones() -> TestResult {
+        let mut broker = broker()?;
+        let plan = approval(Direction::Bullish)?;
+        broker.submit(plan.clone())?;
+        broker.advance(&candle(300, 103, 104, 101, 103)?)?;
+        broker.advance(&candle(360, 103, 113, 102, 112)?)?;
+        let before = broker.snapshot();
+        assert_eq!(before.completed_trades, 1);
+        assert!(before.fees_paid > Decimal::ZERO);
+        broker.select_instrument(ethereum_spec()?, Decimal::from(5), &ethereum_candle(360)?)?;
+        assert_eq!(broker.snapshot(), before);
+        assert_eq!(broker.spec(), &ethereum_spec()?);
+        assert_eq!(broker.accepted.len(), 1);
+        // Completed BTC approvals stay terminal even while ETH is selected.
+        assert!(broker.submit(plan)?.is_empty());
+        assert!(broker.is_flat());
+        assert_eq!(broker.snapshot(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn switching_refuses_pending_and_open_exposure_without_mutating_account() -> TestResult {
+        let mut broker = broker()?;
+        broker.submit(approval(Direction::Bullish)?)?;
+        let pending = broker.snapshot();
+        assert_eq!(broker.select_instrument(ethereum_spec()?, Decimal::from(5), &ethereum_candle(240)?), Err(PaperError::Busy));
+        assert_eq!(broker.snapshot(), pending);
+        broker.advance(&candle(300, 103, 104, 101, 103)?)?;
+        let open = broker.snapshot();
+        assert_eq!(broker.select_instrument(ethereum_spec()?, Decimal::from(5), &ethereum_candle(300)?), Err(PaperError::Busy));
+        assert_eq!(broker.snapshot(), open);
+        assert_eq!(broker.spec(), &spec()?);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_cursor_prevents_fill_on_the_already_observed_signal_bar() -> TestResult {
+        let mut broker = broker()?;
+        let signal = candle(240, 103, 104, 101, 102)?;
+        broker.select_instrument(spec()?, Decimal::from(5), &signal)?;
+        broker.submit(approval(Direction::Bullish)?)?;
+        assert!(broker.advance(&signal)?.is_empty());
+        assert!(broker.pending_intent().is_some());
+        assert!(matches!(broker.advance(&candle(300, 103, 104, 101, 103)?)?.as_slice(), [PaperEvent::EntryFilled { .. }]));
+        Ok(())
+    }
+
+    #[test]
+    fn switching_rejects_invalid_metadata_identity_and_regression_atomically() -> TestResult {
+        let mut broker = broker()?;
+        let original = candle(300, 103, 104, 101, 103)?;
+        broker.advance(&original)?;
+        let before = broker.snapshot();
+        assert!(matches!(broker.select_instrument(ethereum_spec()?, -Decimal::ONE, &ethereum_candle(300)?), Err(PaperError::InvalidConfig(_))));
+        assert!(matches!(broker.select_instrument(ethereum_spec()?, Decimal::ZERO, &original), Err(PaperError::InvalidCandle(_))));
+        assert_eq!(broker.select_instrument(ethereum_spec()?, Decimal::ZERO, &ethereum_candle(240)?), Err(PaperError::OutOfOrder));
+        assert_eq!(broker.select_instrument(spec()?, Decimal::ZERO, &candle(300, 103, 105, 101, 103)?), Err(PaperError::ConflictingDuplicate));
+        let mut provisional = serde_json::to_value(ethereum_candle(300)?)?;
+        provisional["is_closed"] = false.into();
+        assert!(matches!(broker.select_instrument(ethereum_spec()?, Decimal::ZERO, &serde_json::from_value(provisional)?), Err(PaperError::InvalidCandle(_))));
+        assert!(matches!(broker.select_instrument(spec()?, Decimal::ZERO, &candle(301, 103, 104, 101, 103)?), Err(PaperError::InvalidCandle(_))));
+        assert_eq!(broker.snapshot(), before);
+        assert_eq!(broker.spec(), &spec()?);
+        assert_eq!(broker.last_candle.as_ref(), Some(&original));
         Ok(())
     }
 }
