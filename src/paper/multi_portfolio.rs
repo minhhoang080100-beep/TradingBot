@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     candle_store::CandleKey,
     ict_engine::{IctDetectionBatch, IctEngine, IctEngineConfig, IctEngineEvent, KillzoneFilter},
-    models::{Candle, Direction, Exchange, LiquiditySide, MarketKind, SwingKind, SwingPoint,
+    models::{Candle, Direction, Exchange, LiquiditySide, MarketKind, SignalEvent, SwingKind, SwingPoint,
         Timeframe, TradeIntent, VolumeUnit},
     risk::{LiquidityTarget, ReservationEvent, RiskConfig, RiskError, RiskManager, TradeAssessment},
     strategy::{KillzonePolicy, SetupDiscardReason, StrategyAction, StrategyCommand, StrategyConfig, StrategyEngine, StrategyStage},
@@ -87,6 +87,94 @@ pub struct SetupDiscardDiagnostic {
     pub reason: SetupDiscardReason,
 }
 
+/// A cumulative observer count for one finite reason enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiagnosticCount<R> {
+    /// Exact emitted reason; no category is inferred from an absent order.
+    pub reason: R,
+    /// Number of observations, saturating instead of overflowing.
+    pub count: u64,
+}
+
+/// Live-only cumulative observations outside the versioned execution journal.
+///
+/// Raw detector events are independent observations, not a linked trading setup.
+/// Warm-up bars, duplicate batches and unsuccessful batches are excluded. Reason
+/// lists contain at most one entry per enum variant, in first-observed order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LiveSetupCounters {
+    /// Close of the first successfully processed live candle, not process start.
+    pub first_close: Option<DateTime<Utc>>,
+    /// Successfully processed live candles for this symbol.
+    pub candles: u64,
+    /// Raw liquidity-sweep events; one candle can sweep multiple levels.
+    pub liquidity_sweeps: u64,
+    /// Raw MSS events, before strategy confluence requirements.
+    pub market_structure_shifts: u64,
+    /// Newly detected FVG events; lifecycle updates are not counted again.
+    pub fair_value_gaps: u64,
+    /// Candles with a numerically confirmed displacement in either direction.
+    pub displacement_bars: u64,
+    /// Complete strategy entry intents, including subsequently rejected ones.
+    pub intents: u64,
+    /// Entries actually admitted to the shared paper book; not execution fills.
+    pub admitted: u64,
+    /// Rejected intents or strategy inputs, matching the per-batch analysis.
+    pub rejected: u64,
+    /// Exact admission/input rejection categories and their observed counts.
+    pub rejection_reasons: Vec<DiagnosticCount<MultiRejection>>,
+    /// Exact pre-intent discovery discard categories and their observed counts.
+    pub discards: Vec<DiagnosticCount<SetupDiscardReason>>,
+}
+
+impl LiveSetupCounters {
+    fn observe_detection(&mut self, batch: &IctDetectionBatch, at: DateTime<Utc>) {
+        self.first_close.get_or_insert(at);
+        self.candles = self.candles.saturating_add(1);
+        if batch.displacement().is_some() {
+            self.displacement_bars = self.displacement_bars.saturating_add(1);
+        }
+        for signal in batch.signals() {
+            let counter = match signal {
+                SignalEvent::LiquiditySwept(_) => &mut self.liquidity_sweeps,
+                SignalEvent::MarketStructureShiftDetected(_) => &mut self.market_structure_shifts,
+                SignalEvent::FairValueGapDetected(_) => &mut self.fair_value_gaps,
+                _ => continue,
+            };
+            *counter = counter.saturating_add(1);
+        }
+    }
+
+    fn observe_actions(&mut self, actions: &[StrategyAction]) {
+        for action in actions {
+            if let StrategyAction::SetupDiscarded { reason, .. } = action {
+                increment_reason(&mut self.discards, *reason);
+            }
+        }
+    }
+
+    fn observe_outcome(&mut self, analysis: &MultiSymbolAnalysis, events: &[PortfolioEvent]) {
+        self.intents = self.intents.saturating_add(count_as_u64(analysis.intents));
+        self.rejected = self.rejected.saturating_add(count_as_u64(analysis.rejected));
+        for reason in &analysis.rejection_reasons {
+            increment_reason(&mut self.rejection_reasons, *reason);
+        }
+        let admitted = events.iter().filter(|event| matches!(event,
+            PortfolioEvent::EntryPlaced { symbol, .. } if symbol == &analysis.symbol)).count();
+        self.admitted = self.admitted.saturating_add(count_as_u64(admitted));
+    }
+}
+
+fn count_as_u64(count: usize) -> u64 { u64::try_from(count).unwrap_or(u64::MAX) }
+
+fn increment_reason<R: Copy + Eq>(counts: &mut Vec<DiagnosticCount<R>>, reason: R) {
+    if let Some(item) = counts.iter_mut().find(|item| item.reason == reason) {
+        item.count = item.count.saturating_add(1);
+    } else {
+        counts.push(DiagnosticCount { reason, count: 1 });
+    }
+}
+
 /// Bounded, read-only discovery diagnostics outside the deterministic journal.
 ///
 /// Existing positions belong to separate owner strategies and remain described
@@ -101,6 +189,8 @@ pub struct MultiSymbolDiagnostics {
     pub discovery_stage: StrategyStage,
     /// Latest historical discard, absent until a setup has been discarded.
     pub last_discard: Option<SetupDiscardDiagnostic>,
+    /// Cumulative live observations; historical warm-up is deliberately excluded.
+    pub live: LiveSetupCounters,
 }
 
 /// Recoverable V3 rejection reasons; slot, hedge and risk limits are distinct.
@@ -208,6 +298,7 @@ struct SymbolState {
     liquidity_capacity: usize,
     last_analyzed_close: Option<DateTime<Utc>>,
     last_discard: Option<SetupDiscardDiagnostic>,
+    live: LiveSetupCounters,
 }
 
 impl SymbolState {
@@ -218,7 +309,7 @@ impl SymbolState {
             instrument, ict: IctEngine::new(config),
             discovery: StrategyEngine::new(entry_window.strategy_config()),
             liquidity: VecDeque::new(), liquidity_capacity,
-            last_analyzed_close: None, last_discard: None }
+            last_analyzed_close: None, last_discard: None, live: LiveSetupCounters::default() }
     }
 
     fn analyze(&mut self, candle: &Candle) -> Result<IctDetectionBatch, PortfolioError> {
@@ -382,6 +473,7 @@ impl MultiPortfolio {
             last_close: state.last_analyzed_close,
             discovery_stage: state.discovery.stage(&state.key),
             last_discard: state.last_discard,
+            live: state.live.clone(),
         }).collect()
     }
 
@@ -448,16 +540,30 @@ impl MultiPortfolio {
             step.events.extend(cancellations);
         }
         if !was_halted && self.entry_halted() { step.events.push(PortfolioEvent::Halted { at }); }
+        let mut live_updates = Vec::with_capacity(self.symbols.len());
         for (candle, analysis) in ordered.iter().zip(&mut step.analysis) {
             let symbol = candle.instrument().venue_symbol.as_str();
-            let batch = self.state_mut(symbol)?.analyze(candle)?;
+            let state = self.state_mut(symbol)?;
+            let batch = state.analyze(candle)?;
+            let mut live = (!warmup).then(|| state.live.clone());
             analysis.signals = batch.signals().len();
+            if let Some(counters) = &mut live { counters.observe_detection(&batch, at); }
             let event = IctEngineEvent::CandleAnalyzed { candle: (*candle).clone(), batch };
             self.advance_owners(symbol, &event, analysis, &mut step.events)?;
             let actions = self.state_mut(symbol)?.discovery.process_event(event)?;
+            if let Some(counters) = &mut live { counters.observe_actions(&actions); }
             self.discovery_actions(symbol, actions, candle, warmup, analysis, &mut step.events)?;
+            if let Some(mut counters) = live {
+                counters.observe_outcome(analysis, &step.events);
+                live_updates.push(counters);
+            }
         }
         self.history.insert(first.open_time(), ordered.into_iter().cloned().collect());
+        // Commit observations only after every symbol completed successfully.
+        // Both vectors follow the same validated, stable symbol ordering.
+        for (state, counters) in self.symbols.values_mut().zip(live_updates) {
+            state.live = counters;
+        }
         step.snapshot = self.snapshot();
         Ok(step)
     }
@@ -971,6 +1077,111 @@ mod tests {
         engine.process_batch(&batch(-335, NEUTRAL, NEUTRAL)?)?;
         assert_eq!(engine.diagnostics()[0].last_close, Some(at(-334)?));
         assert_eq!(engine.diagnostics()[0].last_discard, Some(discard));
+        Ok(())
+    }
+
+    #[test]
+    fn live_counters_exclude_warmup_and_duplicates_and_match_actual_detector_output() -> TestResult {
+        let mut engine = portfolio()?;
+        let mut detector = IctEngine::new(IctEngineConfig::default());
+        let mut expected_sweeps = 0;
+        let mut expected_mss = 0;
+        let mut expected_fvgs = 0;
+        let mut expected_displacements = 0;
+        for (index, prices) in setup(150).into_iter().enumerate() {
+            let minute = i64::try_from(index)?;
+            let candles = batch(minute, prices, NEUTRAL)?;
+            let detected = detector.process_candle(&candle("BTCUSDT", minute, prices)?)?;
+            if index < 9 {
+                engine.warm_up(&candles)?;
+                assert!(engine.diagnostics().iter().all(|row| row.live == LiveSetupCounters::default()));
+            } else {
+                engine.process_batch(&candles)?;
+                expected_sweeps += detected.signals().iter().filter(|signal| matches!(signal, SignalEvent::LiquiditySwept(_))).count();
+                expected_mss += detected.signals().iter().filter(|signal| matches!(signal, SignalEvent::MarketStructureShiftDetected(_))).count();
+                expected_fvgs += detected.signals().iter().filter(|signal| matches!(signal, SignalEvent::FairValueGapDetected(_))).count();
+                expected_displacements += usize::from(detected.displacement().is_some());
+            }
+        }
+        let diagnostics = engine.diagnostics();
+        let btc = &diagnostics[0].live;
+        assert_eq!(btc.first_close, Some(at(10)?));
+        assert_eq!(btc.candles, 16);
+        assert_eq!(btc.liquidity_sweeps, u64::try_from(expected_sweeps)?);
+        assert_eq!(btc.market_structure_shifts, u64::try_from(expected_mss)?);
+        assert_eq!(btc.fair_value_gaps, u64::try_from(expected_fvgs)?);
+        assert_eq!(btc.displacement_bars, u64::try_from(expected_displacements)?);
+        assert!(btc.liquidity_sweeps > 0 && btc.market_structure_shifts > 0 && btc.fair_value_gaps > 0);
+        assert_eq!((btc.intents, btc.admitted, btc.rejected), (1, 1, 0));
+        assert_eq!(diagnostics[1].live.candles, 16);
+        assert_eq!(diagnostics[1].live.intents, 0);
+        // Replaying either an old warm-up bar or the last live bar is a no-op.
+        engine.process_batch(&batch(0, NEUTRAL, NEUTRAL)?)?;
+        engine.process_batch(&batch(24, [110, 112, 103, 109], NEUTRAL)?)?;
+        assert_eq!(engine.diagnostics(), diagnostics);
+        // A later actual fill must not increment the entry-admission count.
+        let filled = engine.process_batch(&batch(25, [109, 110, 103, 109], NEUTRAL)?)?;
+        assert!(filled.events.iter().any(|event| matches!(event,
+            PortfolioEvent::Execution { event: PaperEvent::EntryFilled { .. }, .. })));
+        assert_eq!(engine.diagnostics()[0].live.admitted, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn warmup_intents_and_discards_are_not_live_observations() -> TestResult {
+        for entry_window in [PaperEntryWindow::Always, PaperEntryWindow::Killzones] {
+            let mut engine = portfolio_with_window(entry_window)?;
+            let mut saw_warmup_rejection = false;
+            for (index, prices) in setup(150).into_iter().enumerate() {
+                let step = engine.warm_up(&batch(i64::try_from(index)? - 360, prices, NEUTRAL)?)?;
+                saw_warmup_rejection |= step.analysis[0].rejection_reasons.contains(&MultiRejection::Warmup);
+            }
+            assert_eq!(saw_warmup_rejection, entry_window == PaperEntryWindow::Always);
+            assert!(engine.diagnostics().iter().all(|row| row.live == LiveSetupCounters::default()));
+            engine.process_batch(&batch(-335, [109, 110, 103, 109], NEUTRAL)?)?;
+            let live = engine.diagnostics()[0].live.clone();
+            assert_eq!(live.candles, 1);
+            assert_eq!(live.first_close, Some(at(-334)?));
+            assert_eq!((live.intents, live.admitted, live.rejected), (0, 0, 0));
+            assert!(live.discards.is_empty() && live.rejection_reasons.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_counters_report_actual_admission_rejections_and_discard_categories() -> TestResult {
+        let mut engine = ready_two_btc()?;
+        engine.process_batch(&batch(52, [159, 160, 153, 159], NEUTRAL)?)?;
+        for (index, prices) in subsequent_setup(400, 100).into_iter().enumerate() {
+            engine.process_batch(&batch(53 + i64::try_from(index)?, prices, NEUTRAL)?)?;
+        }
+        let live = engine.diagnostics()[0].live.clone();
+        assert_eq!((live.intents, live.admitted, live.rejected), (3, 2, 1));
+        assert_eq!(live.rejection_reasons, vec![DiagnosticCount { reason: MultiRejection::SymbolSlots, count: 1 }]);
+
+        let mut gated = portfolio()?;
+        for (index, prices) in setup(150).into_iter().enumerate() {
+            gated.process_batch(&batch(i64::try_from(index)? - 360, prices, NEUTRAL)?)?;
+        }
+        let live = gated.diagnostics()[0].live.clone();
+        assert_eq!((live.intents, live.admitted, live.rejected), (0, 0, 0));
+        assert!(live.discards.contains(&DiagnosticCount { reason: SetupDiscardReason::EntryTouchedOutsideKillzone, count: 1 }));
+        assert!(!gated.snapshot().halted);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_failed_batch_does_not_commit_live_counters() -> TestResult {
+        let mut engine = portfolio()?;
+        engine.process_batch(&batch(0, NEUTRAL, NEUTRAL)?)?;
+        let before: Vec<_> = engine.diagnostics().into_iter().map(|row| row.live).collect();
+        // Simulate an internal ETH detector chronology disagreement, after the
+        // BTC branch can process its next bar. The engine must fail closed.
+        engine.state_mut("ETHUSDT")?.ict.process_candle(&candle("ETHUSDT", 1, NEUTRAL)?)?;
+        assert!(engine.process_batch(&batch(1, NEUTRAL, NEUTRAL)?).is_err());
+        assert!(engine.is_poisoned());
+        let after: Vec<_> = engine.diagnostics().into_iter().map(|row| row.live).collect();
+        assert_eq!(before, after);
         Ok(())
     }
 

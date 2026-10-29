@@ -136,8 +136,8 @@ async fn collect(
     shutdown: &mut (impl Future<Output = std::io::Result<()>> + Unpin),
     recovery_state: &mut FeedRecovery,
 ) -> Result<&'static str, BoxError> {
-    let mut poll = tokio::time::interval(Duration::from_secs(options.poll_seconds));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let poll_period = Duration::from_secs(options.poll_seconds);
+    let mut next_poll = tokio::time::Instant::now();
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + Duration::from_secs(options.heartbeat_seconds), Duration::from_secs(options.heartbeat_seconds));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let deadline = async {
@@ -151,6 +151,9 @@ async fn collect(
         // every retry/backoff. Keep its monotonic value until the cursor really
         // advances: neither a heartbeat nor backward UTC adjustment extends it.
         ensure_joint_feed_current(*cursor, stale_at)?;
+        // Persist the earlier deadline before selecting: a heartbeat winning
+        // at readiness must not restore the later cadence on the next loop.
+        next_poll = next_poll_at(*cursor, Utc::now(), tokio::time::Instant::now(), next_poll)?;
         tokio::select! {
             biased;
             result = &mut *shutdown => { result?; return Ok("shutdown_signal"); }
@@ -160,10 +163,19 @@ async fn collect(
                 ensure_joint_feed_current(*cursor, stale_at)?;
                 let message = format!("{}\n{}", heartbeat_message(session, *cursor, &engine.snapshot(), recovery_state, engine.entry_window()), diagnostics_message(engine));
                 notify(notifier, message);
+                // Keep the account/position report intact; each bounded symbol
+                // summary gets its own message instead of risking truncation.
+                for diagnostic in engine.diagnostics() {
+                    let message = setup_counters_message(session, &diagnostic);
+                    println!("{}", message.replace('\n', " | "));
+                    notify(notifier, message);
+                }
                 continue;
             }
-            _ = poll.tick() => {}
+            () = tokio::time::sleep_until(next_poll) => {}
         }
+        next_poll = tokio::time::Instant::now().checked_add(poll_period)
+            .ok_or("portfolio poll deadline overflow")?;
         // Closed M1 bars cannot add a usable batch until the next close plus
         // settlement delay. Avoid repeatedly downloading the same ten bars.
         // Poll/heartbeat/shutdown and the absolute freshness guard stay active.
@@ -205,6 +217,22 @@ async fn collect(
 fn next_batch_due(cursor: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now.signed_duration_since(cursor)
         >= Timeframe::M1.duration() + chrono::Duration::seconds(SETTLEMENT_DELAY_SECONDS)
+}
+
+// Wake at candle readiness even when the configured polling cadence would skip
+// over it. For example, startup at cursor + 65s with a 60s cadence must fetch at
+// +70s, not wait until +125s and trip the unchanged +120s freshness deadline.
+// Once a batch is already due, respect the cadence for an empty/late response;
+// using an expired readiness instant here would create a busy request loop.
+fn next_poll_at(cursor: DateTime<Utc>, now: DateTime<Utc>, monotonic_now: tokio::time::Instant,
+    next_cadence: tokio::time::Instant,
+) -> Result<tokio::time::Instant, BoxError> {
+    let until_ready = Timeframe::M1.duration() + chrono::Duration::seconds(SETTLEMENT_DELAY_SECONDS)
+        - now.signed_duration_since(cursor);
+    if until_ready <= chrono::Duration::zero() { return Ok(next_cadence); }
+    let ready_at = monotonic_now.checked_add(until_ready.to_std()?)
+        .ok_or("portfolio candle readiness deadline overflow")?;
+    Ok(next_cadence.min(ready_at))
 }
 
 fn ensure_joint_feed_current(cursor: DateTime<Utc>, stale_at: tokio::time::Instant) -> Result<(), BoxError> {
@@ -422,6 +450,21 @@ fn diagnostics_message(engine: &PaperPortfolio) -> String {
             format!("; last discarded setup: {:?} at {} (historical)", last.reason, last.at));
         format!("{} discovery: {stage}{discard}", item.symbol)
     }).collect::<Vec<_>>().join("\n")
+}
+
+fn setup_counters_message(session: Uuid, diagnostic: &ict_trading_bot::paper::MultiSymbolDiagnostics) -> String {
+    let stats = &diagnostic.live;
+    let first = stats.first_close.map_or_else(|| "none yet".to_owned(), |at| at.to_string());
+    let rejections = diagnostic_counts(&stats.rejection_reasons);
+    let discards = diagnostic_counts(&stats.discards);
+    format!("[PAPER] SETUP COUNTERS / {}\nSession: {session}\nLive candles: {}\nFirst live close: {first}\nRaw detections: sweeps={}; MSS={}; new FVG={}; displacement bars={}\nRaw detections may belong to different setups; they are not confirmed entry chains.\nEntry intents: {}\nLimits placed: {} (not necessarily filled)\nRejection events: {} (including strategy input rejections)\nRejection reasons: {rejections}\nDiscarded setups: {discards}\nScope: live candles only; warmup excluded. Cumulative within this session; resets on restart.",
+        diagnostic.symbol, stats.candles, stats.liquidity_sweeps, stats.market_structure_shifts,
+        stats.fair_value_gaps, stats.displacement_bars, stats.intents, stats.admitted, stats.rejected)
+}
+
+fn diagnostic_counts<R: std::fmt::Debug>(counts: &[ict_trading_bot::paper::DiagnosticCount<R>]) -> String {
+    if counts.is_empty() { return "none".to_owned(); }
+    counts.iter().map(|item| format!("{:?}={}", item.reason, item.count)).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -670,6 +713,72 @@ mod notification_tests {
     }
 
     #[test]
+    fn setup_summary_distinguishes_raw_signals_intents_and_admissions() -> Result<(), BoxError> {
+        use ict_trading_bot::paper::{DiagnosticCount, LiveSetupCounters, MultiRejection, MultiSymbolDiagnostics};
+        use ict_trading_bot::strategy::{SetupDiscardReason, StrategyStage};
+        let mut row = MultiSymbolDiagnostics {
+            symbol: "BTCUSDT".to_owned(), last_close: Some(at(420)?),
+            discovery_stage: StrategyStage::WaitingForMss, last_discard: None,
+            live: LiveSetupCounters::default(),
+        };
+        let empty = setup_counters_message(Uuid::from_u128(7), &row);
+        assert!(empty.contains("Live candles: 0\nFirst live close: none yet"));
+        assert!(empty.contains("Rejection reasons: none\nDiscarded setups: none"));
+        row.live = LiveSetupCounters {
+            first_close: Some(at(120)?), candles: 6, liquidity_sweeps: 4,
+            market_structure_shifts: 2, fair_value_gaps: 9, displacement_bars: 3,
+            intents: 2, admitted: 1, rejected: 1,
+            rejection_reasons: vec![DiagnosticCount { reason: MultiRejection::NetRiskReward, count: 1 }],
+            discards: vec![DiagnosticCount { reason: SetupDiscardReason::TimeToLiveExpired, count: 2 }],
+        };
+        let message = setup_counters_message(Uuid::from_u128(7), &row);
+        for required in ["[PAPER] SETUP COUNTERS / BTCUSDT", "Live candles: 6",
+            "Raw detections: sweeps=4; MSS=2; new FVG=9; displacement bars=3",
+            "not confirmed entry chains", "Entry intents: 2", "Limits placed: 1 (not necessarily filled)",
+            "Rejection reasons: NetRiskReward=1", "Discarded setups: TimeToLiveExpired=2",
+            "warmup excluded", "resets on restart"] {
+            assert!(message.contains(required), "missing {required}");
+        }
+        assert!(!message.contains("ENTRY FILLED"));
+        Ok(())
+    }
+
+    #[test]
+    fn every_counter_reason_at_max_width_fits_one_symbol_message() -> Result<(), BoxError> {
+        use ict_trading_bot::paper::{DiagnosticCount, LiveSetupCounters, MultiRejection, MultiSymbolDiagnostics};
+        use ict_trading_bot::strategy::{SetupDiscardReason, StrategyStage};
+        let rejections = [MultiRejection::Warmup, MultiRejection::Halted, MultiRejection::DuplicateSetup,
+            MultiRejection::GlobalSlots, MultiRejection::SymbolSlots, MultiRejection::OpposingDirection,
+            MultiRejection::PortfolioRisk, MultiRejection::NoOpposingLiquidity, MultiRejection::RiskRule,
+            MultiRejection::MinimumOrder, MultiRejection::InsufficientBalance, MultiRejection::NetRiskReward,
+            MultiRejection::StrategyInput];
+        let discards = [SetupDiscardReason::TimeToLiveExpired, SetupDiscardReason::MissingNextCandleFvg,
+            SetupDiscardReason::AmbiguousNextCandleFvg, SetupDiscardReason::FarBoundaryViolated,
+            SetupDiscardReason::EntryTouchedOutsideKillzone, SetupDiscardReason::SeriesReset,
+            SetupDiscardReason::FairValueGapInvalidated, SetupDiscardReason::SupersededByNewSweep,
+            SetupDiscardReason::AmbiguousInput, SetupDiscardReason::InvalidSetup];
+        for symbol in ["BTCUSDT", "ETHUSDT"] {
+            let row = MultiSymbolDiagnostics {
+                symbol: symbol.to_owned(), last_close: Some(at(420)?),
+                discovery_stage: StrategyStage::WaitingForSweep, last_discard: None,
+                live: LiveSetupCounters {
+                    first_close: Some(at(120)?), candles: u64::MAX, liquidity_sweeps: u64::MAX,
+                    market_structure_shifts: u64::MAX, fair_value_gaps: u64::MAX, displacement_bars: u64::MAX,
+                    intents: u64::MAX, admitted: u64::MAX, rejected: u64::MAX,
+                    rejection_reasons: rejections.iter().map(|reason| DiagnosticCount { reason: *reason, count: u64::MAX }).collect(),
+                    discards: discards.iter().map(|reason| DiagnosticCount { reason: *reason, count: u64::MAX }).collect(),
+                },
+            };
+            let message = setup_counters_message(Uuid::from_u128(7), &row);
+            assert!(message.chars().count() <= 4096);
+            assert!(message.contains(&format!("/ {symbol}")));
+            for reason in &rejections { assert!(message.contains(&format!("{reason:?}={}", u64::MAX))); }
+            for reason in &discards { assert!(message.contains(&format!("{reason:?}={}", u64::MAX))); }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn exiting_one_btc_trade_does_not_borrow_the_other_btc_entry() -> Result<(), BoxError> {
         let mut snapshot = snapshot();
         let closed = order()?;
@@ -793,7 +902,9 @@ mod notification_tests {
         let config = PaperConfig::new(Decimal::new(12345, 2), Decimal::new(6, 4),
             Decimal::TWO, Decimal::ONE, Decimal::TWO)?.with_leverage(10)?;
         let mut engine = PaperPortfolio::new(vec![metadata("BTCUSDT")?, metadata("ETHUSDT")?], config, Timeframe::M1)?;
-        let close = Utc::now().timestamp().div_euclid(60) * 60 - 60;
+        // Keep the mock's newest bar settled but safely inside freshness even
+        // when the real retry delay crosses a UTC minute boundary.
+        let close = (Utc::now().timestamp() - SETTLEMENT_DELAY_SECONDS).div_euclid(60) * 60;
         let cursor = at(close - 60)?;
         let seed = vec![candle("BTCUSDT", close - 120)?, candle("ETHUSDT", close - 120)?];
         engine.warm_up(&seed)?;
@@ -894,6 +1005,74 @@ mod notification_tests {
         assert!(!next_batch_due(at(60)?, at(129)?));
         assert!(next_batch_due(at(60)?, at(130)?));
         assert!(!next_batch_due(at(60)?, at(59)?));
+        Ok(())
+    }
+
+    #[test]
+    fn polling_reaches_ready_candles_for_every_allowed_cadence_and_start_phase() -> Result<(), BoxError> {
+        // Model the runner's actual wait/advance loop with a deterministic pair
+        // of clocks. The last settled startup candle can be 10..69 seconds old.
+        // Every supported CLI cadence must reach readiness before +120s stale.
+        let base = tokio::time::Instant::now();
+        for period in 1..=60_u64 {
+            for startup_age in 10..70_u64 {
+                let mut now = base + Duration::from_secs(startup_age);
+                let mut next_cadence = now;
+                let mut cursor = at(0)?;
+                let mut requests = Vec::new();
+                while requests.len() < 3 {
+                    let elapsed = now.duration_since(base).as_secs();
+                    let utc = at(i64::try_from(elapsed)?)?;
+                    let wake = next_poll_at(cursor, utc, now, next_cadence)?;
+                    now = wake;
+                    next_cadence = now + Duration::from_secs(period);
+                    let utc = at(i64::try_from(now.duration_since(base).as_secs())?)?;
+                    assert!(super::super::remaining_feed_budget(cursor, utc).is_ok());
+                    if next_batch_due(cursor, utc) {
+                        requests.push(utc.timestamp());
+                        cursor = at(utc.timestamp() / 60 * 60)?;
+                    }
+                }
+                assert_eq!(requests, [70, 130, 190], "period={period} phase={startup_age}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ready_but_empty_round_keeps_retry_cadence_without_spinning() -> Result<(), BoxError> {
+        let base = tokio::time::Instant::now();
+        let cursor = at(0)?;
+        let next_cadence = base + Duration::from_secs(5);
+        for elapsed in 0..5_u64 {
+            // A successful HTTP round at +70s had no new complete batch.
+            // Heartbeats between +70 and +75 must not bypass its retry cadence.
+            let now = base + Duration::from_secs(elapsed);
+            assert_eq!(next_poll_at(cursor, at(70 + i64::try_from(elapsed)?)?, now,
+                next_cadence)?, next_cadence);
+        }
+        // The schedule does not manufacture a fresh cursor or extend the feed
+        // budget: the existing absolute stale guard still rejects +120s.
+        assert!(super::super::remaining_feed_budget(cursor, at(120)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_at_candle_readiness_does_not_restore_the_later_poll_deadline() -> Result<(), BoxError> {
+        let base = tokio::time::Instant::now();
+        let cursor = at(0)?;
+        let mut next_poll = base + Duration::from_secs(125);
+        next_poll = next_poll_at(cursor, at(65)?, base + Duration::from_secs(65), next_poll)?;
+        assert_eq!(next_poll, base + Duration::from_secs(70));
+        // The biased select services a simultaneously-ready heartbeat first.
+        // Re-entering the loop retains readiness, even a second after it was due.
+        for age in [70_u64, 71] {
+            let now = base + Duration::from_secs(age);
+            next_poll = next_poll_at(cursor, at(i64::try_from(age)?)?, now, next_poll)?;
+            assert!(next_poll <= now);
+            assert_eq!(next_poll, base + Duration::from_secs(70));
+            assert!(next_batch_due(cursor, at(i64::try_from(age)?)?));
+        }
         Ok(())
     }
 

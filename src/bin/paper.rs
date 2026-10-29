@@ -48,6 +48,7 @@ Legacy live is single-symbol 1x, entry notional+fee <= cash.
 Portfolio v4 shares ONE account across BTC/ETH; max 4 active, max 2 per symbol.
 New portfolio sessions default to entry-window always (24/7, including weekends).
 Use --entry-window killzones for weekday New York session filtering.
+Portfolio --warmup accepts 50..=999, reserving one REST bar for settlement.
 Only the time gate changes; a complete ICT setup and risk approval are required.
 Pending entries and open positions both occupy slots; no opposite-side hedging.
 Combined planned risk <= 3% at admission; each trade <= 1% (not 4 full-risk trades).
@@ -201,6 +202,9 @@ fn parse_args(mut args: VecDeque<String>) -> Result<Command, BoxError> {
             return Err("--warmup must be in 50..=1000".into());
         }
         if mode == "portfolio" {
+            if warmup > 999 {
+                return Err("portfolio --warmup must be in 50..=999; one REST bar is reserved for settlement".into());
+            }
             let (symbols, leverage, heartbeat_seconds) = portfolio_parameters(&mut flags)?;
             let entry_window = match flags.remove("--entry-window").as_deref().unwrap_or("always") {
                 "always" => PaperEntryWindow::Always,
@@ -583,6 +587,19 @@ mod tests {
         assert_eq!(options.config.leverage(), 10);
         assert_eq!(options.heartbeat_seconds, 1800);
         assert_eq!(options.entry_window, PaperEntryWindow::Always);
+        Ok(())
+    }
+
+    #[test]
+    fn portfolio_warmup_reserves_a_settlement_bar_before_any_network_request() -> Result<(), BoxError> {
+        let Command::Portfolio(options) = command(&["portfolio", "--warmup", "999"])? else {
+            return Err("wrong command".into());
+        };
+        assert_eq!(options.warmup, 999);
+        let error = command(&["portfolio", "--warmup", "1000"]).err().ok_or("accepted impossible warmup capacity")?;
+        assert!(error.to_string().contains("one REST bar is reserved for settlement"));
+        // The older single-symbol runner does not apply the settlement filter.
+        assert!(matches!(command(&["live", "--warmup", "1000"]), Ok(Command::Live(_))));
         Ok(())
     }
 
