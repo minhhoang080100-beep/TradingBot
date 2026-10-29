@@ -29,10 +29,11 @@ pub async fn live(options: PortfolioOptions) -> Result<(), BoxError> {
     let session = Uuid::new_v4();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let result = run_session(&options, notifier.as_ref(), session, &mut shutdown).await;
-    if result.is_err() {
+    let mut stopped_notice_attempted = false;
+    let result = run_session(&options, notifier.as_ref(), session, &mut shutdown, &mut stopped_notice_attempted).await;
+    if result.is_err() && !stopped_notice_attempted {
         // Error objects are not sent externally: they could include paths or IDs.
-        notify(notifier.as_ref(), format!("[PAPER] STOPPED / ERROR\nSession: {session}\nBot has stopped. Inspect Railway logs; do not assume existing exposure was closed. Restart creates a NEW account."));
+        notify(notifier.as_ref(), format!("[PAPER] BOT ĐÃ DỪNG DO LỖI\nCần kiểm tra log Railway. Không xem vị thế cũ là đã đóng.\nKhởi động lại tạo tài khoản paper mới.\nPhiên: {}", short_id(session)));
     }
     if let Some(notifier) = notifier {
         let stats = notifier.shutdown().await;
@@ -43,6 +44,7 @@ pub async fn live(options: PortfolioOptions) -> Result<(), BoxError> {
 
 async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotifier>, session: Uuid,
     shutdown: &mut (impl Future<Output = std::io::Result<()>> + Unpin),
+    stopped_notice_attempted: &mut bool,
 ) -> Result<(), BoxError> {
     let market = PublicPaperMarket::new()?;
     let mut recovery_state = FeedRecovery::default();
@@ -61,7 +63,7 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
         biased;
         result = &mut *shutdown => {
             result?;
-            notify(notifier, format!("[PAPER] STOPPED during startup\nSession: {session}\nNo paper orders were opened; no session log was started."));
+            notify(notifier, format!("[PAPER] ĐÃ DỪNG KHỞI ĐỘNG\nChưa tạo lệnh hoặc bắt đầu nhật ký phiên.\nPhiên: {}", short_id(session)));
             return Ok(());
         }
         result = startup => result?,
@@ -101,8 +103,7 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
     println!("PAPER PORTFOLIO V4 | max_active=4 | max_per_symbol=2 | total_risk_cap=3% | symbols={} | initial={} USDT | leverage={}x | entry_window={} | warmup={} each | candle_delay=10s | session={} | log={}",
         options.symbols.join(","), options.config.initial_balance(), options.config.leverage(), options.entry_window.as_str(), options.warmup, session, options.output.display());
     println!("{}", serde_json::to_string(&engine.snapshot())?);
-    notify(notifier, format!("[PAPER V4] STARTED\nSession: {session}\nSymbols: {} / M1\nShared balance: {} USDT\nLeverage: {}x (initial-margin simulation only)\nEntry schedule: {}\nComplete sweep/MSS/FVG/retracement setup is still required.\nRisk: <=1% per trade, <=3% combined at admission; daily breaker: 5%; net RR >= 2\nMax 4 active (pending + open), max 2 per symbol. Each setup has its own Entry/TP/SL. No opposite-side hedging on the same symbol.\nSlots do not guarantee available risk or margin.\nFunding/venue liquidation not modeled. Restart does not resume.\nLast closed candle: {cursor}",
-        options.symbols.join(", "), options.config.initial_balance(), options.config.leverage(), entry_schedule(options.entry_window)));
+    notify(notifier, startup_message(session, options, cursor));
     let outcome = collect(&market, &instruments, options, &mut engine, &mut log, &mut recent, &mut cursor,
         notifier, session, shutdown, &mut recovery_state).await;
     let reason = outcome.as_ref().map_or("error", |reason| *reason);
@@ -121,10 +122,11 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
         else { log.finish(at, reason, &snapshot, &events) }
     })?;
     if failed_engine { eprintln!("Portfolio engine failed; aborted journal is diagnostic-only, not replay-complete."); }
-    publish_events(notifier, session, &events, &snapshot, options.config);
+    publish_events(notifier, session, &events, &snapshot, options.config, false);
     println!("Stopped ({reason}); portfolio open positions are marked, not forcibly closed.");
     println!("{}", serde_json::to_string(&snapshot)?);
     notify(notifier, status_message(session, reason, Some(cursor), &snapshot));
+    *stopped_notice_attempted = true;
     outcome.map(|_| ())
 }
 
@@ -161,14 +163,14 @@ async fn collect(
             () = tokio::time::sleep_until(stale_at) => return Err("synchronized portfolio feed is stale; recovery stopped".into()),
             _ = heartbeat.tick() => {
                 ensure_joint_feed_current(*cursor, stale_at)?;
-                let message = format!("{}\n{}", heartbeat_message(session, *cursor, &engine.snapshot(), recovery_state, engine.entry_window()), diagnostics_message(engine));
+                let diagnostics = engine.diagnostics();
+                let message = heartbeat_message(session, *cursor, &engine.snapshot(), recovery_state, engine.entry_window(), &diagnostics);
                 notify(notifier, message);
-                // Keep the account/position report intact; each bounded symbol
-                // summary gets its own message instead of risking truncation.
-                for diagnostic in engine.diagnostics() {
+                // Technical counters stay in console; Telegram receives one
+                // bounded account/position/setup digest instead of three texts.
+                for diagnostic in diagnostics {
                     let message = setup_counters_message(session, &diagnostic);
                     println!("{}", message.replace('\n', " | "));
-                    notify(notifier, message);
                 }
                 continue;
             }
@@ -200,9 +202,14 @@ async fn collect(
             let step = engine.process_batch(&batch)?;
             // Journal evidence precedes best-effort external notification.
             tokio::task::block_in_place(|| log.append(&batch, false, &step))?;
-            println!("{}", serde_json::to_string(&step)?);
-            println!("Paper setup diagnostics: {}", diagnostics_message(engine).replace('\n', " | "));
-            publish_events(notifier, session, &step.events, &step.snapshot, options.config);
+            // Complete inputs/outcomes remain in the fsynced journal above.
+            // Console output summarizes idle bars; lifecycle evidence is still
+            // emitted in full when an actual order event occurs.
+            println!("{}", compact_batch_log(at, &step, &engine.diagnostics()));
+            if !step.events.is_empty() {
+                println!("PAPER EVENTS {}", serde_json::to_string(&step.events)?);
+            }
+            publish_events(notifier, session, &step.events, &step.snapshot, options.config, true);
             *cursor = at;
             stale_at = feed_deadline(*cursor)?;
             retain(recent, batch);
@@ -212,6 +219,23 @@ async fn collect(
         // discontinuous candle must fail before this post-commit notification.
         if advanced { recovery_state.committed(notifier, session, *cursor); }
     }
+}
+
+fn compact_batch_log(at: DateTime<Utc>, step: &ict_trading_bot::paper::MultiPortfolioStep,
+    diagnostics: &[ict_trading_bot::paper::MultiSymbolDiagnostics],
+) -> String {
+    let account = &step.snapshot.account;
+    let symbols = step.analysis.iter().map(|analysis| {
+        let stage = diagnostics.iter().find(|row| row.symbol == analysis.symbol)
+            .map_or_else(|| "unknown".to_owned(), |row| format!("{:?}", row.discovery_stage));
+        let rejected = if analysis.rejection_reasons.is_empty() { String::new() }
+            else { format!(" {:?}", analysis.rejection_reasons) };
+        format!("{} signals={} intents={} rejected={}{rejected} stage={stage}",
+            analysis.symbol, analysis.signals, analysis.intents, analysis.rejected)
+    }).collect::<Vec<_>>().join(" | ");
+    format!("PAPER M1 close={} balance={} equity={} active={}/4 risk={} halted={} | {symbols}",
+        at.format("%Y-%m-%dT%H:%M:%SZ"), account.balance.normalize(), account.equity.normalize(),
+        account.orders.len(), account.reserved_risk.normalize(), step.snapshot.halted)
 }
 
 fn next_batch_due(cursor: DateTime<Utc>, now: DateTime<Utc>) -> bool {
@@ -304,13 +328,13 @@ struct FeedRecovery {
 impl FeedRecovery {
     fn observe(&mut self, notice: &RecoveryNotice, notifier: Option<&TelegramNotifier>, session: Uuid) {
         recovery::log_notice(notice);
-        if let RecoveryNotice::Retrying { operation, next_attempt, max_attempts, delay, error, .. } = notice {
+        if let RecoveryNotice::Retrying { next_attempt, max_attempts, delay, error, .. } = notice {
             self.episode_retries = self.episode_retries.saturating_add(1);
             self.total_retries = self.total_retries.saturating_add(1);
             if !self.outage_announced {
                 self.outage_announced = true;
                 self.started = Some(tokio::time::Instant::now());
-                notify(notifier, format!("[PAPER] PUBLIC DATA RETRY (temporary)\nSession: {session}\nOperation: {operation}\nReason: {error}\nNext attempt: {next_attempt}/{max_attempts}; wait {} ms\nNew entry processing is paused until synchronized data is validated and journaled. Same account retained.\nPaper TP/SL uses closed-candle OHLC; no realtime exchange protection. Stale or invalid data stops the session.", delay.as_millis()));
+                notify(notifier, retry_message(session, error, *next_attempt, *max_attempts, *delay));
             }
         }
         // Recovered here means only that HTTP parsing completed. Announce
@@ -322,7 +346,7 @@ impl FeedRecovery {
             self.outage_announced = false;
             let elapsed = self.started.take().map_or(0, |at| at.elapsed().as_secs());
             self.recoveries = self.recoveries.saturating_add(1);
-            notify(notifier, format!("[PAPER] PUBLIC DATA RECOVERED\nSession: {session}\nRetries: {}; elapsed to validated batch: {elapsed}s\nComplete synchronized data was validated and journaled. Same account retained; data processing resumed subject to entry windows and risk limits.\nLast processed close: {cursor}\nAny catch-up fills are closed-candle OHLC simulation, not realtime protective execution.", self.episode_retries));
+            notify(notifier, format!("[PAPER] DỮ LIỆU ĐÃ PHỤC HỒI\nNến mới đã kiểm tra: {}\nĐã thử lại {} lần trong {elapsed} giây; giữ nguyên vốn và lệnh.\nBot tiếp tục xét setup theo giới hạn rủi ro. TP/SL paper được mô phỏng theo nến đóng, không theo tick.\nPhiên: {}", vietnam_time(cursor), self.episode_retries, short_id(session)));
             self.episode_retries = 0;
         }
     }
@@ -356,100 +380,182 @@ fn notify(notifier: Option<&TelegramNotifier>, message: String) {
     }
 }
 
-fn publish_events(notifier: Option<&TelegramNotifier>, session: Uuid, events: &[PortfolioEvent], snapshot: &PortfolioSnapshot, config: PaperConfig) {
+fn publish_events(notifier: Option<&TelegramNotifier>, session: Uuid, events: &[PortfolioEvent], snapshot: &PortfolioSnapshot, config: PaperConfig, include_halt: bool) {
     for event in events {
+        if !include_halt && matches!(event, PortfolioEvent::Halted { .. }) { continue; }
         notify(notifier, event_message(session, event, snapshot, config));
     }
+}
+
+// Display-only suffix; journal and console retain complete UUIDs for identity.
+fn short_id(id: Uuid) -> String { id.simple().to_string().chars().skip(20).collect() }
+
+fn vietnam_time(at: DateTime<Utc>) -> String {
+    at.with_timezone(&chrono_tz::Asia::Ho_Chi_Minh).format("%d/%m/%Y %H:%M:%S VN").to_string()
+}
+
+fn startup_message(session: Uuid, options: &PortfolioOptions, cursor: DateTime<Utc>) -> String {
+    format!("[PAPER] ĐÃ KHỞI ĐỘNG\n{} · M1 · x{}\nVốn mới: {} USDT | Lịch: {}\nTối đa 4 lệnh, 2/cặp; rủi ro 1%/lệnh, tổng 3% khi nhận lệnh; ngắt lỗ ngày 5%.\nChỉ đặt lệnh khi đủ setup và lời/lỗ sau chi phí đạt 2:1.\nNến đã xử lý: {}\nĐây là mô phỏng, không đặt lệnh thật. Khởi động lại tạo phiên mới; chưa mô phỏng funding/thanh lý.\nPhiên: {}",
+        options.symbols.join(" + "), options.config.leverage(), options.config.initial_balance(),
+        entry_schedule(options.entry_window), vietnam_time(cursor), short_id(session))
+}
+
+fn retry_message(session: Uuid, error: &PaperMarketError, next_attempt: u8, max_attempts: u8, delay: Duration) -> String {
+    let cause = match error {
+        PaperMarketError::Venue(10006) | PaperMarketError::HttpStatus(429)
+        | PaperMarketError::HttpRetryAfter { status: 429, .. } => "sàn đang giới hạn tần suất truy cập".to_owned(),
+        PaperMarketError::Timeout => "sàn phản hồi quá chậm".to_owned(),
+        PaperMarketError::Transport | PaperMarketError::Connection => "kết nối tới sàn bị gián đoạn".to_owned(),
+        PaperMarketError::ResponseBody | PaperMarketError::MalformedResponse { .. } => "phản hồi từ sàn chưa đọc được đầy đủ".to_owned(),
+        PaperMarketError::Venue(code) => format!("sàn tạm báo lỗi {code}"),
+        PaperMarketError::HttpStatus(status) | PaperMarketError::HttpRetryAfter { status, .. }
+        | PaperMarketError::InvalidRetryAfter(status) => format!("dịch vụ dữ liệu báo HTTP {status}"),
+        _ => "dữ liệu chưa đạt kiểm tra an toàn".to_owned(),
+    };
+    let seconds = delay.as_secs().saturating_add(u64::from(delay.subsec_nanos() > 0));
+    format!("[PAPER] TẠM CHỜ DỮ LIỆU\nNguyên nhân: {cause}.\nTự thử lại lần {next_attempt}/{max_attempts} sau {seconds} giây. Chưa cần thao tác.\nGiữ nguyên vốn/lệnh; tạm ngừng xử lý nến. TP/SL paper không chạy theo tick trong lúc mất dữ liệu.\nNếu không phục hồi đúng hạn, bot sẽ dừng và báo lại.\nPhiên: {}", short_id(session))
 }
 
 fn order_details(order: &PaperOrderSnapshot, leverage: u32) -> String {
     let side = match order.direction { Direction::Bullish => "LONG", Direction::Bearish => "SHORT" };
     let notional = order.entry_price.checked_mul(order.quantity);
     let margin = notional.and_then(|value| value.checked_div(leverage.into()));
-    let amount = |value: Option<rust_decimal::Decimal>| value.map_or_else(|| "unavailable".to_owned(), |value| value.normalize().to_string());
-    format!("Side: {side}\nEntry: {}\nTP: {}\nSL: {}\nQuantity: {}\nLeverage: {leverage}x\nEntry notional: {} USDT\nInitial margin estimate: {} USDT (fees additional)\nTrade ID: {}",
-        order.entry_price, order.take_profit_price, order.stop_loss_price, order.quantity, amount(notional), amount(margin), order.intent_id)
+    let amount = |value: Option<rust_decimal::Decimal>| value.map_or_else(|| "chưa xác định".to_owned(), |value| value.normalize().to_string());
+    format!("{side} · x{leverage} · Mã lệnh: {}\nEntry: {} | TP: {} | SL: {}\nKhối lượng: {} | Ký quỹ ước tính: {} USDT + phí",
+        short_id(order.intent_id), order.entry_price, order.take_profit_price, order.stop_loss_price, order.quantity, amount(margin))
 }
 
 fn event_message(session: Uuid, event: &PortfolioEvent, snapshot: &PortfolioSnapshot, config: PaperConfig) -> String {
     let body = match event {
-        PortfolioEvent::EntryPlaced { symbol, at, order } => format!("LIMIT PLACED / NOT FILLED\nSymbol: {symbol}\nObserved: {at}\n{}\nEntry expires: {}", order_details(order, config.leverage()), order.expires_at),
+        PortfolioEvent::EntryPlaced { symbol, at, order } => format!("ĐẶT LIMIT — CHƯA KHỚP\n{symbol} | {}\n{}\nHết hạn chờ: {}", vietnam_time(*at), order_details(order, config.leverage()), vietnam_time(order.expires_at)),
         PortfolioEvent::Execution { symbol, event, order } => {
             let state = match event {
-                PaperEvent::EntryFilled { at, price, fee, .. } => format!("ENTRY FILLED (simulated)\nObserved: {at}\nFill price: {price}\nEntry fee: {fee} USDT"),
-                PaperEvent::EntryCancelled { at, reason, .. } => format!("ENTRY CANCELLED\nObserved: {at}\nReason: {reason:?}"),
-                PaperEvent::PositionClosed { at, exit_price, net_pnl, fee, reason, .. } => format!("POSITION CLOSED / {reason:?}\nObserved: {at}\nExit: {exit_price}\nNet trade PnL: {net_pnl} USDT\nExit fee: {fee} USDT"),
+                PaperEvent::EntryFilled { at, price, fee, .. } => format!("ĐÃ KHỚP LỆNH MÔ PHỎNG\n{symbol} | {}\nGiá khớp: {price} | Phí vào: {fee} USDT", vietnam_time(*at)),
+                PaperEvent::EntryCancelled { at, reason, .. } => {
+                    let reason = match reason {
+                        ict_trading_bot::paper::PaperCancelReason::Expired => "hết thời gian chờ khớp",
+                        ict_trading_bot::paper::PaperCancelReason::Requested => "strategy hoặc phiên yêu cầu hủy",
+                    };
+                    format!("ĐÃ HỦY LIMIT CHƯA KHỚP\n{symbol} | {}\nLý do: {reason}", vietnam_time(*at))
+                }
+                PaperEvent::PositionClosed { at, exit_price, net_pnl, reason, .. } => {
+                    let reason = match reason {
+                        ict_trading_bot::paper::PaperExitReason::TakeProfit => "ĐÃ CHỐT TP",
+                        ict_trading_bot::paper::PaperExitReason::StopLoss => "ĐÃ CẮT SL",
+                    };
+                    format!("{reason}\n{symbol} | {}\nGiá thoát: {exit_price}\nLãi/lỗ ròng lệnh: {net_pnl} USDT (đã trừ phí)", vietnam_time(*at))
+                }
             };
-            format!("{state}\nSymbol: {symbol}\n{}", order_details(order, config.leverage()))
+            format!("{state}\n{}", order_details(order, config.leverage()))
         }
-        PortfolioEvent::Halted { at } => format!("ENTRIES HALTED (risk or session stop)\nObserved: {at}\nInspect portfolio logs; new entries are blocked."),
+        PortfolioEvent::Halted { at } => format!("TẠM NGỪNG LỆNH MỚI\n{}\nGiới hạn rủi ro hoặc trạng thái phiên đang chặn vào lệnh. Vị thế đang mở chưa được xem là đã đóng.", vietnam_time(*at)),
     };
-    format!("[PAPER] {body}\nSession: {session}\nPost-batch balance/equity: {}/{} USDT\nPost-batch active: {}/4; reserved risk: {} USDT\nPost-batch reserved capital: {} USDT; available cash: {} USDT\nOHLC simulation; not exchange execution.", snapshot.account.balance, snapshot.account.equity, snapshot.account.orders.len(), snapshot.account.reserved_risk, snapshot.account.reserved_capital, snapshot.account.available_cash)
+    format!("[PAPER] {body}\nSau nến: số dư {} | tổng tài sản {} USDT\nĐang chờ/mở: {}/4 | Vốn khả dụng: {} USDT\nPhiên: {} · Mô phỏng theo nến đóng, không phải khớp lệnh trên sàn.",
+        snapshot.account.balance, snapshot.account.equity, snapshot.account.orders.len(), snapshot.account.available_cash, short_id(session))
 }
 
 fn status_message(session: Uuid, reason: &str, last_close: Option<DateTime<Utc>>, snapshot: &PortfolioSnapshot) -> String {
     let detail = if snapshot.account.orders.is_empty() {
-        "Exposure: FLAT".to_owned()
+        "Chưa có lệnh chờ hoặc vị thế mở.".to_owned()
     } else {
         snapshot.account.orders.iter().map(|active| {
-            let state = match active.state { BookOrderState::Pending => "PENDING", BookOrderState::Open => "OPEN" };
+            let state = match active.state { BookOrderState::Pending => "CHỜ KHỚP", BookOrderState::Open => "ĐANG MỞ" };
             let side = match active.order.direction { Direction::Bullish => "LONG", Direction::Bearish => "SHORT" };
-            format!("Exposure: {state} {} {side}\nTrade ID: {}\nEntry: {} | TP: {} | SL: {}\nQuantity: {} | Reserved risk: {} USDT\nReserved capital (margin + fees): {} USDT",
-                active.symbol, active.order.intent_id, active.order.entry_price, active.order.take_profit_price,
+            format!("{state} {} {side} · Mã lệnh: {}\nEntry: {} | TP: {} | SL: {}\nKL: {} | Rủi ro giữ chỗ: {} | Vốn giữ chỗ: {} USDT",
+                active.symbol, short_id(active.order.intent_id), active.order.entry_price, active.order.take_profit_price,
                 active.order.stop_loss_price, active.order.quantity, active.reserved_risk, active.reserved_capital)
         }).collect::<Vec<_>>().join("\n\n")
     };
     let btc = snapshot.account.orders.iter().filter(|order| order.symbol == "BTCUSDT").count();
     let eth = snapshot.account.orders.iter().filter(|order| order.symbol == "ETHUSDT").count();
-    format!("[PAPER] {reason}\nSession: {session}\nBalance: {} USDT\nEquity: {} USDT\nRealized PnL: {} USDT\nUnrealized PnL: {} USDT\nFees paid: {} USDT\nCompleted trades: {}\nRisk/session halt: {}\nLast processed close: {}\nLeverage: {}x\nActive (pending + open): {}/4; BTC {btc}/2; ETH {eth}/2\nReserved risk: {} USDT (3% cap at admission)\nReserved capital: {} USDT; available cash: {} USDT\n{detail}",
+    let label = match reason {
+        "HEARTBEAT" => "CẬP NHẬT",
+        "duration_elapsed" => "ĐÃ DỪNG — HẾT THỜI GIAN CHẠY THỬ",
+        "shutdown_signal" => "ĐÃ DỪNG THEO YÊU CẦU",
+        "STOPPED during warmup" => "ĐÃ DỪNG KHI NẠP DỮ LIỆU",
+        _ => "ĐÃ DỪNG DO LỖI — KIỂM TRA RAILWAY",
+    };
+    let stop_note = if reason == "HEARTBEAT" { "" } else { "\nPending đã hủy; vị thế còn mở chỉ được ghi nhận, không tự đóng. Khởi động lại tạo phiên mới." };
+    format!("[PAPER] {label}\nNến: {}\nSố dư: {} | Tổng tài sản: {} USDT\nLãi/lỗ đã ghi nhận (sau phí): {} | Đang mở: {} | Phí: {} USDT\nĐã đóng: {} lệnh (thắng {}/thua {})\nĐòn bẩy: x{} | Lệnh chờ + mở: {}/4 (BTC {btc}/2, ETH {eth}/2)\nRủi ro giữ chỗ: {} USDT | Vốn khả dụng: {} USDT\n\n{detail}{stop_note}\nPhiên: {}",
+        last_close.map_or_else(|| "chưa có".to_owned(), vietnam_time),
         snapshot.account.balance, snapshot.account.equity, snapshot.account.realized_pnl, snapshot.account.unrealized_pnl, snapshot.account.fees_paid,
-        snapshot.account.completed_trades, snapshot.halted, last_close.map_or_else(|| "none".to_owned(), |at| at.to_string()),
-        snapshot.account.leverage, snapshot.account.orders.len(), snapshot.account.reserved_risk, snapshot.account.reserved_capital, snapshot.account.available_cash)
+        snapshot.account.completed_trades, snapshot.account.wins, snapshot.account.losses,
+        snapshot.account.leverage, snapshot.account.orders.len(), snapshot.account.reserved_risk, snapshot.account.available_cash, short_id(session))
 }
 
 fn heartbeat_message(session: Uuid, cursor: DateTime<Utc>, snapshot: &PortfolioSnapshot,
-    recovery: &FeedRecovery, entry_window: PaperEntryWindow) -> String {
+    recovery: &FeedRecovery, entry_window: PaperEntryWindow, diagnostics: &[ict_trading_bot::paper::MultiSymbolDiagnostics]) -> String {
     let window = KillzoneFilter::default().classify(cursor);
     let window_name = match (entry_window, window) {
-        (PaperEntryWindow::Always, _) => "OPEN (24/7, including weekends)",
-        (_, Some(Killzone::London)) => "OPEN (London)",
-        (_, Some(Killzone::NewYork)) => "OPEN (New York)",
-        (_, None) => "CLOSED (outside configured entry hours)",
+        (PaperEntryWindow::Always, _) => "24/7",
+        (_, Some(Killzone::London)) => "đang trong phiên London",
+        (_, Some(Killzone::NewYork)) => "đang trong phiên New York",
+        (_, None) => "ngoài giờ vào lệnh",
     };
-    let feed = if recovery.outage_announced { "RETRYING / awaiting validated batch" }
-        else { "CURRENT (last processed batch validated)" };
-    let gate = if snapshot.halted { "PAUSED: risk/session halt" }
-        else if recovery.outage_announced { "PAUSED: public data recovery" }
-        else if !entry_window.allows(cursor) { "PAUSED: outside entry window" }
-        else { "OPEN: still requires a valid setup, free slots and risk/margin approval" };
-    format!("{}\n\nFeed: {feed}\nFeed retries/recoveries this session: {}/{}\nEntry window at last candle: {window_name}\nNew entry timing/data gate: {gate}\nLast candle (Vietnam): {}\nSchedule: {}. Existing paper orders continue to be simulated outside entry windows.",
+    let feed = if recovery.outage_announced { "đang thử kết nối lại" } else { "nến mới đã kiểm tra" };
+    let gate = if snapshot.halted { "tạm dừng do rủi ro/trạng thái phiên" }
+        else if recovery.outage_announced { "tạm chờ dữ liệu" }
+        else if !entry_window.allows(cursor) { "tạm chờ đúng phiên" }
+        else { "sẵn sàng khi đủ setup và vốn/rủi ro" };
+    let setups = diagnostics.iter().map(setup_digest).collect::<Vec<_>>().join("\n");
+    format!("{}\n\nDữ liệu: {feed} | Lịch: {window_name}\nLệnh mới: {gate}\nKết nối: {} lần thử lại / {} lần phục hồi\n\n{setups}\nSố liệu setup tính từ đầu phiên, bỏ warmup. Tín hiệu rời rạc chưa đồng nghĩa có lệnh.\nPAPER: mô phỏng theo nến đóng; TP/SL không phải lệnh thật trên sàn.",
         status_message(session, "HEARTBEAT", Some(cursor), snapshot), recovery.total_retries,
-        recovery.recoveries, cursor.with_timezone(&chrono_tz::Asia::Ho_Chi_Minh).format("%Y-%m-%d %H:%M:%S %Z"), entry_schedule(entry_window))
+        recovery.recoveries)
 }
 
 fn entry_schedule(entry_window: PaperEntryWindow) -> &'static str {
     match entry_window {
-        PaperEntryWindow::Always => "24/7 (every day, including weekends)",
-        PaperEntryWindow::Killzones => "weekdays 02:00-05:00 / 07:00-10:00 America/New_York (DST-aware)",
+        PaperEntryWindow::Always => "24/7, cả cuối tuần",
+        PaperEntryWindow::Killzones => "02–05h và 07–10h New York, thứ Hai–Sáu (có DST)",
     }
 }
 
-fn diagnostics_message(engine: &PaperPortfolio) -> String {
+fn setup_digest(item: &ict_trading_bot::paper::MultiSymbolDiagnostics) -> String {
     use ict_trading_bot::strategy::StrategyStage;
-    engine.diagnostics().iter().map(|item| {
-        let stage = match item.discovery_stage {
-            StrategyStage::WaitingForSweep => "waiting for liquidity sweep",
-            StrategyStage::WaitingForMss => "sweep seen; waiting for displacement + MSS",
-            StrategyStage::WaitingForFvg => "MSS seen; waiting for FVG confirmation",
-            StrategyStage::WaitingForRetracement => "FVG armed; waiting for retracement",
-            StrategyStage::EntryPending => "limit entry pending",
-            StrategyStage::CancellationPending => "entry cancellation pending",
-            StrategyStage::InPosition => "position open",
-        };
-        let discard = item.last_discard.as_ref().map_or_else(String::new, |last|
-            format!("; last discarded setup: {:?} at {} (historical)", last.reason, last.at));
-        format!("{} discovery: {stage}{discard}", item.symbol)
-    }).collect::<Vec<_>>().join("\n")
+    let stage = match item.discovery_stage {
+        StrategyStage::WaitingForSweep => "chờ quét thanh khoản",
+        StrategyStage::WaitingForMss => "đã có sweep; chờ MSS + nến đẩy mạnh",
+        StrategyStage::WaitingForFvg => "đã có MSS; chờ FVG",
+        StrategyStage::WaitingForRetracement => "đã có FVG; chờ giá hồi về entry",
+        StrategyStage::EntryPending => "limit đang chờ khớp",
+        StrategyStage::CancellationPending => "đang chờ xác nhận hủy",
+        StrategyStage::InPosition => "đang có vị thế",
+    };
+    let stats = &item.live;
+    let rejection = dominant_reason(&stats.rejection_reasons, rejection_label);
+    let discard = dominant_reason(&stats.discards, discard_label);
+    format!("{}: {stage}\n  Setup đủ chuỗi: {} | Limit nhận: {} | Từ chối: {}\n  Tín hiệu: sweep {} / MSS {} / FVG {}\n  Lý do từ chối nhiều nhất: {rejection}\n  Setup bị loại nhiều nhất: {discard}",
+        item.symbol, stats.intents, stats.admitted, stats.rejected, stats.liquidity_sweeps,
+        stats.market_structure_shifts, stats.fair_value_gaps)
+}
+
+fn dominant_reason<R: Copy>(counts: &[ict_trading_bot::paper::DiagnosticCount<R>], label: impl Fn(R) -> &'static str) -> String {
+    counts.iter().filter(|item| item.count > 0).max_by_key(|item| item.count)
+        .map_or_else(|| "chưa có".to_owned(), |item| format!("{} ({})", label(item.reason), item.count))
+}
+
+fn rejection_label(reason: ict_trading_bot::paper::MultiRejection) -> &'static str {
+    use ict_trading_bot::paper::MultiRejection as R;
+    match reason {
+        R::Warmup => "đang nạp nến lịch sử", R::Halted => "đang chặn rủi ro mới",
+        R::DuplicateSetup => "setup đã được xét", R::GlobalSlots => "đã đủ 4 lệnh",
+        R::SymbolSlots => "cặp đã đủ 2 lệnh", R::OpposingDirection => "đã có lệnh ngược chiều",
+        R::PortfolioRisk => "đã hết hạn mức rủi ro chung", R::NoOpposingLiquidity => "thiếu mục tiêu thanh khoản để đặt TP",
+        R::RiskRule => "chưa đạt điều kiện rủi ro/TP", R::MinimumOrder => "nhỏ hơn khối lượng tối thiểu",
+        R::InsufficientBalance => "thiếu vốn ký quỹ và phí", R::NetRiskReward => "lời/lỗ sau chi phí dưới 2:1",
+        R::StrategyInput => "dữ liệu setup không nhất quán",
+    }
+}
+
+fn discard_label(reason: ict_trading_bot::strategy::SetupDiscardReason) -> &'static str {
+    use ict_trading_bot::strategy::SetupDiscardReason as R;
+    match reason {
+        R::TimeToLiveExpired => "setup hết thời gian chờ", R::MissingNextCandleFvg => "không có FVG ngay sau MSS",
+        R::AmbiguousNextCandleFvg => "FVG xác nhận không rõ ràng", R::FarBoundaryViolated => "giá đóng vượt biên FVG",
+        R::EntryTouchedOutsideKillzone => "chạm entry ngoài giờ cho phép", R::SeriesReset => "chuỗi nến bị gián đoạn",
+        R::FairValueGapInvalidated => "FVG đã mất hiệu lực", R::SupersededByNewSweep => "có sweep mới thay setup cũ",
+        R::AmbiguousInput => "tín hiệu mâu thuẫn", R::InvalidSetup => "setup không hợp lệ",
+    }
 }
 
 fn setup_counters_message(session: Uuid, diagnostic: &ict_trading_bot::paper::MultiSymbolDiagnostics) -> String {
@@ -540,8 +646,8 @@ mod notification_tests {
             &snapshot,
             config,
         );
-        assert!(placed.contains("LIMIT PLACED / NOT FILLED"));
-        assert!(!placed.contains("ENTRY FILLED (simulated)"));
+        assert!(placed.contains("ĐẶT LIMIT — CHƯA KHỚP"));
+        assert!(!placed.contains("ĐÃ KHỚP LỆNH MÔ PHỎNG"));
         let filled = event_message(
             session,
             &PortfolioEvent::Execution {
@@ -559,23 +665,23 @@ mod notification_tests {
             config,
         );
         for required in [
-            "[PAPER] ENTRY FILLED (simulated)",
-            "Symbol: BTCUSDT",
-            "Side: LONG",
+            "[PAPER] ĐÃ KHỚP LỆNH MÔ PHỎNG",
+            "BTCUSDT |",
+            "LONG · x10",
             "Entry: 100",
             "TP: 110",
             "SL: 95",
-            "Quantity: 2",
-            "Leverage: 10x",
-            "Entry notional: 200 USDT",
-            "Initial margin estimate: 20 USDT (fees additional)",
-            "Post-batch balance/equity: 99.88/100.12 USDT",
-            "OHLC simulation; not exchange execution.",
+            "Khối lượng: 2",
+            "x10",
+            "Entry: 100 | TP: 110 | SL: 95",
+            "Ký quỹ ước tính: 20 USDT + phí",
+            "Sau nến: số dư 99.88 | tổng tài sản 100.12 USDT",
+            "Mô phỏng theo nến đóng, không phải khớp lệnh trên sàn.",
         ] {
             assert!(filled.contains(required), "missing expected notification field: {required}");
         }
-        assert!(filled.contains(&format!("Trade ID: {}", order.intent_id)));
-        assert!(filled.contains(&format!("Session: {session}")));
+        assert!(filled.contains(&format!("Mã lệnh: {}", short_id(order.intent_id))));
+        assert!(filled.contains(&format!("Phiên: {}", short_id(session))));
         assert!(filled.chars().count() <= 4096);
         Ok(())
     }
@@ -588,8 +694,8 @@ mod notification_tests {
         order.stop_loss_price = Decimal::new(105, 0);
         order.take_profit_price = Decimal::new(90, 0);
         for (reason, exit_price, net_pnl, label) in [
-            (PaperExitReason::TakeProfit, Decimal::new(90, 0), Decimal::new(19772, 3), "TakeProfit"),
-            (PaperExitReason::StopLoss, Decimal::new(105_021, 3), Decimal::new(-102_880_252, 7), "StopLoss"),
+            (PaperExitReason::TakeProfit, Decimal::new(90, 0), Decimal::new(19772, 3), "ĐÃ CHỐT TP"),
+            (PaperExitReason::StopLoss, Decimal::new(105_021, 3), Decimal::new(-102_880_252, 7), "ĐÃ CẮT SL"),
         ] {
             // The exit alert uses geometry retained in the event even when the
             // shared post-batch account has become flat or acquired a new owner.
@@ -614,15 +720,15 @@ mod notification_tests {
                 &snapshot,
                 config,
             );
-            assert!(message.contains(&format!("POSITION CLOSED / {label}")));
-            assert!(message.contains("Symbol: ETHUSDT"));
-            assert!(!message.contains("Symbol: BTCUSDT"));
-            assert!(message.contains("Side: SHORT"));
-            assert!(message.contains("TP: 90\nSL: 105"));
-            assert!(message.contains(&format!("Exit: {exit_price}")));
-            assert!(message.contains(&format!("Net trade PnL: {net_pnl} USDT")));
-            assert!(message.contains("Leverage: 10x"));
-            assert!(message.contains("Initial margin estimate: 20 USDT"));
+            assert!(message.contains(label));
+            assert!(message.contains("ETHUSDT |"));
+            assert!(!message.contains("BTCUSDT |"));
+            assert!(message.contains("SHORT · x10"));
+            assert!(message.contains("TP: 90 | SL: 105"));
+            assert!(message.contains(&format!("Giá thoát: {exit_price}")));
+            assert!(message.contains(&format!("Lãi/lỗ ròng lệnh: {net_pnl} USDT")));
+            assert!(message.contains("x10"));
+            assert!(message.contains("Ký quỹ ước tính: 20 USDT"));
             assert!(message.chars().count() <= 4096);
         }
         Ok(())
@@ -646,16 +752,16 @@ mod notification_tests {
             &snapshot(),
             config,
         );
-        assert!(cancelled.contains("ENTRY CANCELLED"));
-        assert!(!cancelled.contains("ENTRY FILLED"));
+        assert!(cancelled.contains("ĐÃ HỦY LIMIT CHƯA KHỚP"));
+        assert!(!cancelled.contains("ĐÃ KHỚP LỆNH MÔ PHỎNG"));
         let halted = event_message(
             Uuid::from_u128(7),
             &PortfolioEvent::Halted { at: at(420)? },
             &snapshot(),
             config,
         );
-        assert!(halted.contains("ENTRIES HALTED (risk or session stop)"));
-        assert!(!halted.contains("RISK HALTED"));
+        assert!(halted.contains("TẠM NGỪNG LỆNH MỚI"));
+        assert!(!halted.contains("ĐÃ CẮT SL"));
         Ok(())
     }
 
@@ -665,18 +771,18 @@ mod notification_tests {
         snapshot.account.orders.push(active_order("ETHUSDT", BookOrderState::Open)?);
         snapshot.halted = true;
         let message = status_message(Uuid::from_u128(7), "duration_elapsed", Some(at(420)?), &snapshot);
-        assert!(message.contains("[PAPER] duration_elapsed"));
-        assert!(message.contains("Balance: 99.88 USDT\nEquity: 100.12 USDT"));
-        assert!(message.contains("Exposure: OPEN ETHUSDT"));
-        assert!(message.contains("Leverage: 10x"));
-        assert!(!message.contains("Exposure: FLAT"));
-        assert!(!message.contains("POSITION CLOSED"));
+        assert!(message.contains("[PAPER] ĐÃ DỪNG — HẾT THỜI GIAN CHẠY THỬ"));
+        assert!(message.contains("Số dư: 99.88 | Tổng tài sản: 100.12 USDT"));
+        assert!(message.contains("ĐANG MỞ ETHUSDT"));
+        assert!(message.contains("x10"));
+        assert!(!message.contains("Chưa có lệnh chờ hoặc vị thế mở."));
+        assert!(message.contains("vị thế còn mở chỉ được ghi nhận, không tự đóng"));
         snapshot.account.orders[0].state = BookOrderState::Pending;
         let message = status_message(Uuid::from_u128(7), "HEARTBEAT", Some(at(420)?), &snapshot);
-        assert!(message.contains("Exposure: PENDING ETHUSDT"));
+        assert!(message.contains("CHỜ KHỚP ETHUSDT"));
         snapshot.account.orders.clear();
         let message = status_message(Uuid::from_u128(7), "HEARTBEAT", Some(at(420)?), &snapshot);
-        assert!(message.contains("Exposure: FLAT"));
+        assert!(message.contains("Chưa có lệnh chờ hoặc vị thế mở."));
         Ok(())
     }
 
@@ -697,18 +803,94 @@ mod notification_tests {
             snapshot.account.orders.push(active);
         }
         let recovery = FeedRecovery { total_retries: u64::MAX, recoveries: u64::MAX, ..FeedRecovery::default() };
-        let mut message = heartbeat_message(Uuid::from_u128(7), at(420)?, &snapshot, &recovery, PaperEntryWindow::Killzones);
-        // Reserve ample space for the bounded two-symbol diagnostics suffix.
-        message.push_str(&"x".repeat(512));
-        assert!(message.contains("Active (pending + open): 4/4; BTC 2/2; ETH 2/2"));
-        assert_eq!(message.matches("Trade ID:").count(), 4);
-        for active in &snapshot.account.orders {
-            assert!(message.contains(&active.order.intent_id.to_string()));
+        for value in [&mut snapshot.account.balance, &mut snapshot.account.equity,
+            &mut snapshot.account.realized_pnl, &mut snapshot.account.unrealized_pnl,
+            &mut snapshot.account.fees_paid, &mut snapshot.account.reserved_risk,
+            &mut snapshot.account.available_cash] {
+            *value = Decimal::MIN;
         }
-        assert!(message.contains("Exposure: PENDING BTCUSDT"));
-        assert!(message.contains("Exposure: OPEN ETHUSDT"));
-        assert!(!message.contains("Exposure: FLAT"));
+        snapshot.account.completed_trades = u64::MAX;
+        snapshot.account.wins = u64::MAX;
+        snapshot.account.losses = u64::MAX;
+        let rows = [max_diagnostic("BTCUSDT")?, max_diagnostic("ETHUSDT")?];
+        let message = heartbeat_message(Uuid::from_u128(7), at(420)?, &snapshot, &recovery, PaperEntryWindow::Killzones, &rows);
+        assert!(message.contains("Lệnh chờ + mở: 4/4 (BTC 2/2, ETH 2/2)"));
+        assert_eq!(message.matches("Mã lệnh:").count(), 4);
+        for active in &snapshot.account.orders {
+            assert!(message.contains(&short_id(active.order.intent_id)));
+        }
+        assert!(message.contains("CHỜ KHỚP BTCUSDT"));
+        assert!(message.contains("ĐANG MỞ ETHUSDT"));
+        assert!(!message.contains("Chưa có lệnh chờ hoặc vị thế mở."));
         assert!(message.chars().count() <= 4096);
+        assert_eq!(message.matches("[PAPER]").count(), 1);
+        assert!(message.contains("thiếu mục tiêu thanh khoản để đặt TP"));
+        assert!(!message.contains("NoOpposingLiquidity"));
+        Ok(())
+    }
+
+    fn max_diagnostic(symbol: &str) -> Result<ict_trading_bot::paper::MultiSymbolDiagnostics, BoxError> {
+        use ict_trading_bot::paper::{DiagnosticCount, LiveSetupCounters, MultiRejection, MultiSymbolDiagnostics};
+        use ict_trading_bot::strategy::{SetupDiscardReason, StrategyStage};
+        Ok(MultiSymbolDiagnostics {
+            symbol: symbol.to_owned(), last_close: Some(at(420)?),
+            discovery_stage: StrategyStage::WaitingForRetracement, last_discard: None,
+            live: LiveSetupCounters {
+                first_close: Some(at(120)?), candles: u64::MAX, liquidity_sweeps: u64::MAX,
+                market_structure_shifts: u64::MAX, fair_value_gaps: u64::MAX, displacement_bars: u64::MAX,
+                intents: u64::MAX, admitted: u64::MAX, rejected: u64::MAX,
+                rejection_reasons: vec![DiagnosticCount { reason: MultiRejection::NoOpposingLiquidity, count: u64::MAX }],
+                discards: vec![DiagnosticCount { reason: SetupDiscardReason::EntryTouchedOutsideKillzone, count: u64::MAX }],
+            },
+        })
+    }
+
+    #[test]
+    fn compact_setup_digest_explains_actual_rejections_without_claiming_fills() -> Result<(), BoxError> {
+        let mut row = max_diagnostic("BTCUSDT")?;
+        row.live.intents = 1;
+        row.live.admitted = 0;
+        row.live.rejected = 1;
+        row.live.rejection_reasons[0].count = 1;
+        row.live.discards.clear();
+        let message = setup_digest(&row);
+        assert!(message.contains("BTCUSDT: đã có FVG; chờ giá hồi về entry"));
+        assert!(message.contains("Setup đủ chuỗi: 1 | Limit nhận: 0 | Từ chối: 1"));
+        assert!(message.contains("thiếu mục tiêu thanh khoản để đặt TP (1)"));
+        assert!(message.contains("Setup bị loại nhiều nhất: chưa có"));
+        assert!(!message.contains("NoOpposingLiquidity"));
+        assert!(!message.contains("ĐÃ KHỚP"));
+        Ok(())
+    }
+
+    #[test]
+    fn retry_notice_is_actionable_sanitized_and_uses_short_session_reference() {
+        let session = Uuid::from_u128(7);
+        let message = retry_message(session, &PaperMarketError::Venue(10006), 2, 4, Duration::from_millis(1250));
+        assert!(message.contains("[PAPER] TẠM CHỜ DỮ LIỆU"));
+        assert!(message.contains("sàn đang giới hạn tần suất truy cập"));
+        assert!(message.contains("lần 2/4 sau 2 giây. Chưa cần thao tác"));
+        assert!(message.contains("Giữ nguyên vốn/lệnh"));
+        assert!(message.contains("TP/SL paper không chạy theo tick"));
+        assert!(message.contains(&short_id(session)));
+        assert!(!message.contains(&session.to_string()));
+        assert!(message.chars().count() < 700);
+        assert!(retry_message(session, &PaperMarketError::Timeout, 2, 4, Duration::from_secs(1)).contains("sàn phản hồi quá chậm"));
+    }
+
+    #[test]
+    fn startup_notice_gives_policy_and_warns_that_restart_is_a_new_account() -> Result<(), BoxError> {
+        let super::super::Command::Portfolio(options) = super::super::parse_args(VecDeque::from(["portfolio".to_owned()]))? else {
+            return Err("expected portfolio fixture".into());
+        };
+        let cursor = DateTime::parse_from_rfc3339("2026-10-29T03:14:00Z")?.with_timezone(&Utc);
+        let message = startup_message(Uuid::from_u128(7), &options, cursor);
+        for field in ["[PAPER] ĐÃ KHỞI ĐỘNG", "BTCUSDT + ETHUSDT · M1 · x10",
+            "Vốn mới: 100 USDT", "Lịch: 24/7, cả cuối tuần", "tổng 3%", "ngắt lỗ ngày 5%",
+            "không đặt lệnh thật", "Khởi động lại tạo phiên mới", "29/10/2026 10:14:00 VN"] {
+            assert!(message.contains(field), "missing {field}");
+        }
+        assert!(message.chars().count() < 750);
         Ok(())
     }
 
@@ -772,8 +954,16 @@ mod notification_tests {
             let message = setup_counters_message(Uuid::from_u128(7), &row);
             assert!(message.chars().count() <= 4096);
             assert!(message.contains(&format!("/ {symbol}")));
-            for reason in &rejections { assert!(message.contains(&format!("{reason:?}={}", u64::MAX))); }
-            for reason in &discards { assert!(message.contains(&format!("{reason:?}={}", u64::MAX))); }
+            for reason in &rejections {
+                assert!(message.contains(&format!("{reason:?}={}", u64::MAX)));
+                assert!(!rejection_label(*reason).is_empty());
+                assert_ne!(rejection_label(*reason), format!("{reason:?}"));
+            }
+            for reason in &discards {
+                assert!(message.contains(&format!("{reason:?}={}", u64::MAX)));
+                assert!(!discard_label(*reason).is_empty());
+                assert_ne!(discard_label(*reason), format!("{reason:?}"));
+            }
         }
         Ok(())
     }
@@ -799,9 +989,9 @@ mod notification_tests {
             order: closed,
         };
         let message = event_message(Uuid::from_u128(7), &event, &snapshot, PaperConfig::default().with_leverage(10)?);
-        assert!(message.contains("Entry: 100\nTP: 110\nSL: 95"));
+        assert!(message.contains("Entry: 100 | TP: 110 | SL: 95"));
         assert!(!message.contains("Entry: 200"));
-        assert!(message.contains("Post-batch active: 1/4"));
+        assert!(message.contains("Đang chờ/mở: 1/4"));
         let heartbeat = status_message(Uuid::from_u128(7), "HEARTBEAT", Some(at(420)?), &snapshot);
         assert!(heartbeat.contains("Entry: 200 | TP: 220 | SL: 190"));
         assert!(!heartbeat.contains("Entry: 100"));
@@ -863,8 +1053,9 @@ mod notification_tests {
             entry_window: PaperEntryWindow::Always,
         };
         let mut shutdown = std::future::ready(Ok(()));
+        let mut stopped_notice_attempted = false;
         // Biased shutdown wins before the public-data future is ever polled.
-        run_session(&options, None, Uuid::new_v4(), &mut shutdown).await?;
+        run_session(&options, None, Uuid::new_v4(), &mut shutdown, &mut stopped_notice_attempted).await?;
         assert!(!output.exists());
         Ok(())
     }
@@ -1082,38 +1273,38 @@ mod notification_tests {
         let inside = DateTime::parse_from_rfc3339("2026-10-29T06:30:00Z")?.with_timezone(&Utc);
         let mut snapshot = snapshot();
         let mut recovery = FeedRecovery::default();
-        let message = heartbeat_message(Uuid::nil(), outside, &snapshot, &recovery, PaperEntryWindow::Killzones);
-        assert!(message.contains("Risk/session halt: false"));
-        assert!(message.contains("Entry window at last candle: CLOSED"));
-        assert!(message.contains("PAUSED: outside entry window"));
-        assert!(message.contains("2026-10-29 07:35:00"));
+        let message = heartbeat_message(Uuid::nil(), outside, &snapshot, &recovery, PaperEntryWindow::Killzones, &[]);
+        assert!(message.contains("Lệnh mới: tạm chờ đúng phiên"));
+        assert!(message.contains("Lịch: ngoài giờ vào lệnh"));
+        assert!(message.contains("tạm chờ đúng phiên"));
+        assert!(message.contains("29/10/2026 07:35:00 VN"));
         assert!(!message.contains("Entries blocked: false"));
         recovery.outage_announced = true;
-        let message = heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones);
-        assert!(message.contains("RETRYING / awaiting validated batch"));
-        assert!(message.contains("PAUSED: public data recovery"));
+        let message = heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones, &[]);
+        assert!(message.contains("Dữ liệu: đang thử kết nối lại"));
+        assert!(message.contains("Lệnh mới: tạm chờ dữ liệu"));
         recovery.outage_announced = false;
         snapshot.halted = true;
-        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones).contains("PAUSED: risk/session halt"));
+        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones, &[]).contains("Lệnh mới: tạm dừng do rủi ro/trạng thái phiên"));
         snapshot.halted = false;
-        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones).contains("OPEN: still requires a valid setup"));
+        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones, &[]).contains("Lệnh mới: sẵn sàng khi đủ setup"));
         Ok(())
     }
 
     #[test]
     fn heartbeat_entry_windows_follow_dst_weekdays_and_exclusive_end() -> Result<(), BoxError> {
         for (timestamp, expected) in [
-            ("2026-10-29T06:00:00Z", "OPEN (London)"),
-            ("2026-10-29T09:00:00Z", "CLOSED"),
-            ("2026-10-29T11:00:00Z", "OPEN (New York)"),
-            ("2026-10-29T14:00:00Z", "CLOSED"),
-            ("2026-11-02T06:30:00Z", "CLOSED"),
-            ("2026-11-02T07:00:00Z", "OPEN (London)"),
-            ("2026-10-31T06:30:00Z", "CLOSED"),
+            ("2026-10-29T06:00:00Z", "đang trong phiên London"),
+            ("2026-10-29T09:00:00Z", "ngoài giờ vào lệnh"),
+            ("2026-10-29T11:00:00Z", "đang trong phiên New York"),
+            ("2026-10-29T14:00:00Z", "ngoài giờ vào lệnh"),
+            ("2026-11-02T06:30:00Z", "ngoài giờ vào lệnh"),
+            ("2026-11-02T07:00:00Z", "đang trong phiên London"),
+            ("2026-10-31T06:30:00Z", "ngoài giờ vào lệnh"),
         ] {
             let at = DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc);
-            let message = heartbeat_message(Uuid::nil(), at, &snapshot(), &FeedRecovery::default(), PaperEntryWindow::Killzones);
-            assert!(message.contains(&format!("Entry window at last candle: {expected}")), "{timestamp}");
+            let message = heartbeat_message(Uuid::nil(), at, &snapshot(), &FeedRecovery::default(), PaperEntryWindow::Killzones, &[]);
+            assert!(message.contains(&format!("Lịch: {expected}")), "{timestamp}");
         }
         Ok(())
     }
@@ -1124,18 +1315,18 @@ mod notification_tests {
             let at = DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc);
             let mut snapshot = snapshot();
             let mut recovery = FeedRecovery::default();
-            let message = heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always);
-            assert!(message.contains("Entry window at last candle: OPEN (24/7, including weekends)"));
-            assert!(message.contains("OPEN: still requires a valid setup"));
-            assert!(!message.contains("PAUSED: outside entry window"));
-            assert!(message.contains("Schedule: 24/7"));
+            let message = heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always, &[]);
+            assert!(message.contains("Lịch: 24/7"));
+            assert!(message.contains("Lệnh mới: sẵn sàng khi đủ setup"));
+            assert!(!message.contains("tạm chờ đúng phiên"));
+            assert!(message.contains("Lịch: 24/7"));
             snapshot.halted = true;
-            assert!(heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always)
-                .contains("PAUSED: risk/session halt"));
+            assert!(heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always, &[])
+                .contains("Lệnh mới: tạm dừng do rủi ro/trạng thái phiên"));
             snapshot.halted = false;
             recovery.outage_announced = true;
-            assert!(heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always)
-                .contains("PAUSED: public data recovery"));
+            assert!(heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always, &[])
+                .contains("Lệnh mới: tạm chờ dữ liệu"));
         }
         Ok(())
     }
@@ -1207,6 +1398,90 @@ mod notification_tests {
         let extended = feed_deadline(cursor)?;
         assert!(extended > expired);
         assert!(ensure_joint_feed_current(cursor, expired).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod compact_console_tests {
+    use super::*;
+    use ict_trading_bot::{
+        paper::{BookSnapshot, LiveSetupCounters, MultiPortfolioStep, MultiRejection,
+            MultiSymbolAnalysis, MultiSymbolDiagnostics, SetupDiscardDiagnostic},
+        strategy::{SetupDiscardReason, StrategyStage},
+    };
+    use rust_decimal::Decimal;
+
+    fn fixture() -> Result<(DateTime<Utc>, MultiPortfolioStep, Vec<MultiSymbolDiagnostics>), BoxError> {
+        let at = DateTime::parse_from_rfc3339("2026-10-29T02:33:00Z")?.with_timezone(&Utc);
+        let step = MultiPortfolioStep {
+            snapshot: PortfolioSnapshot {
+                account: BookSnapshot {
+                    initial_balance: Decimal::from(100), balance: Decimal::from(100),
+                    equity: Decimal::from(100), realized_pnl: Decimal::ZERO,
+                    unrealized_pnl: Decimal::ZERO, fees_paid: Decimal::ZERO,
+                    completed_trades: 0, wins: 0, losses: 0, leverage: 10,
+                    orders: Vec::new(), reserved_risk: Decimal::ZERO,
+                    reserved_capital: Decimal::ZERO, available_cash: Decimal::from(100),
+                },
+                halted: false,
+            },
+            events: Vec::new(),
+            analysis: vec![
+                MultiSymbolAnalysis { symbol: "BTCUSDT".to_owned(), signals: 1, intents: 1,
+                    rejected: 1, rejection_reasons: vec![MultiRejection::NoOpposingLiquidity] },
+                MultiSymbolAnalysis { symbol: "ETHUSDT".to_owned(), signals: 0, intents: 0,
+                    rejected: 0, rejection_reasons: Vec::new() },
+            ],
+        };
+        let diagnostics = vec![
+            MultiSymbolDiagnostics {
+                symbol: "BTCUSDT".to_owned(), last_close: Some(at),
+                discovery_stage: StrategyStage::WaitingForSweep,
+                last_discard: Some(SetupDiscardDiagnostic { at,
+                    reason: SetupDiscardReason::TimeToLiveExpired }),
+                live: LiveSetupCounters::default(),
+            },
+            MultiSymbolDiagnostics {
+                symbol: "ETHUSDT".to_owned(), last_close: Some(at),
+                discovery_stage: StrategyStage::WaitingForMss, last_discard: None,
+                live: LiveSetupCounters::default(),
+            },
+        ];
+        Ok((at, step, diagnostics))
+    }
+
+    #[test]
+    fn concise_console_keeps_actual_rejection_account_and_current_stages() -> Result<(), BoxError> {
+        let (at, step, diagnostics) = fixture()?;
+        let before = serde_json::to_value(&step)?;
+        let line = compact_batch_log(at, &step, &diagnostics);
+        for expected in ["PAPER M1 close=2026-10-29T02:33:00Z", "balance=100 equity=100 active=0/4 risk=0 halted=false",
+            "BTCUSDT signals=1 intents=1 rejected=1 [NoOpposingLiquidity] stage=WaitingForSweep",
+            "ETHUSDT signals=0 intents=0 rejected=0 stage=WaitingForMss"] {
+            assert!(line.contains(expected), "missing {expected}");
+        }
+        assert!(!line.contains('\n'));
+        assert!(!line.contains("TimeToLiveExpired"), "historical discards must not repeat every minute");
+        assert_eq!(serde_json::to_value(&step)?, before);
+        assert!(compact_batch_log(at, &step, &[]).contains("stage=unknown"));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_console_reduces_serialized_no_event_output() -> Result<(), BoxError> {
+        let (at, mut step, diagnostics) = fixture()?;
+        for analysis in &mut step.analysis {
+            analysis.intents = 0;
+            analysis.rejected = 0;
+            analysis.rejection_reasons.clear();
+        }
+        let old_json = serde_json::to_string(&step)?;
+        let compact = compact_batch_log(at, &step, &diagnostics);
+        // Conservative comparison: the old logger additionally repeated two
+        // long diagnostics lines, which are not included in this baseline.
+        assert!(compact.len() < old_json.len());
+        println!("console fixture bytes: prior_step_json={} compact={}", old_json.len(), compact.len());
         Ok(())
     }
 }

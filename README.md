@@ -38,16 +38,21 @@ Hai runner `live` và `portfolio` thử lại **chỉ các GET dữ liệu công
 - Tôn trọng `Retry-After` hợp lệ trên HTTP 429/503. Nếu thời gian chờ không nằm trong ngân sách phục hồi, bot dừng thay vì gửi sớm hơn yêu cầu của server. Header sai/không rõ cũng dừng; không đổi region, proxy hay endpoint để né giới hạn. [Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after)
 - Mỗi lần thử lấy timestamp request mới. Portfolio thử lại **cả vòng BTC+ETH**, không ghép kết quả BTC cũ với ETH của lần gọi sau. Trong lúc chờ, không gọi engine, không tạo entry/fill và không đặt lại cash, position hay daily-risk baseline.
 - Ngưỡng feed 120 giây tính từ nến cuối **đã xử lý**, có hiệu lực cả khi đang chờ request/backoff/heartbeat. Giữ deadline monotonic đến khi cursor tiến lên, đồng thời kiểm tra UTC; poll/heartbeat hoặc chỉnh lùi đồng hồ không gia hạn deadline của cùng một nến. Trước khi tiếp tục, toàn bộ cửa sổ hồi phục phải đủ, mới và liên tục. TP/SL paper không chạy theo tick trong thời gian mất dữ liệu; khi hồi phục hợp lệ, engine chỉ mô phỏng lại theo các nến nhận được.
-- Nếu Telegram đang bật, portfolio gửi `PUBLIC DATA RETRY (temporary)` khi bắt đầu retry, kèm mã/loại lỗi đã làm sạch, lượt thử tiếp theo và thời gian chờ. Lỗi transport phân biệt timeout, connection và interrupted body; không xuất URL/error thô. Chỉ báo phục hồi sau khi batch đồng bộ mới (hoặc toàn bộ warmup lúc startup) đã được kiểm tra và ghi journal. Tin phục hồi có số lần retry và thời gian đến batch hợp lệ; HTTP thành công đơn thuần chưa đủ. Các tin dùng cùng session ID và cùng cơ chế best-effort của notifier.
+- Nếu Telegram đang bật, portfolio gửi một tin `TẠM CHỜ DỮ LIỆU` khi bắt đầu mỗi đợt lỗi, giải thích nguyên nhân, lần thử tiếp theo và thời gian chờ. Tin `DỮ LIỆU ĐÃ PHỤC HỒI` chỉ được gửi sau khi batch đồng bộ mới (hoặc toàn bộ warmup lúc startup) đã được kiểm tra và ghi journal; HTTP thành công đơn thuần chưa đủ. Không gửi lại cảnh báo ở mọi lần retry. Console giữ chẩn đoán kỹ thuật đã làm sạch; không xuất URL/error thô hoặc bí mật.
 - SIGTERM/Ctrl+C hủy được request/backoff cả trong startup. Thời hạn `--seconds` tính từ sau warmup và hủy được request/backoff của vòng chạy live. Hết số lần thử/ngân sách hoặc quá stale: bot ghi summary nếu còn ghi đĩa được, hủy pending và giữ vị thế mở dưới dạng marked như trước, sau đó báo lỗi. **Không tự restart hoặc khôi phục tài khoản sau process restart.**
 
 ### Telegram: theo dõi pending, Entry, TP, SL và PnL
 
-Telegram chỉ là kênh thông báo, không điều khiển giao dịch. Tính năng mặc định **tắt**, chỉ bật trong `paper portfolio`. Tin có nhãn `[PAPER]` (startup `[PAPER V4]`), symbol, LONG/SHORT, Entry, TP, SL, quantity, x10, margin ước tính, trade/session ID và balance/equity sau batch. Heartbeat liệt kê **từng lệnh pending/open**, số chỗ BTC/ETH, tổng risk/capital giữ chỗ và cash còn khả dụng; không gộp hai entry cùng symbol thành một giá vào lệnh. Có tin khi đặt limit **chưa khớp**, khớp giả lập, hủy, đóng TP/SL, chặn entry, khởi động/dừng và heartbeat mặc định mỗi 30 phút (`--heartbeat-seconds`, tối thiểu 60). Quan sát theo nến đóng, không phải cập nhật giá tick hay realtime fill từ sàn.
+Telegram chỉ là kênh thông báo, không điều khiển giao dịch. Tính năng mặc định **tắt**, chỉ bật trong `paper portfolio`. Tin dùng tiếng Việt, nhãn `[PAPER]` và giờ Việt Nam. Mã lệnh/mã phiên hiển thị 12 ký tự cuối để dễ đối chiếu; UUID đầy đủ vẫn có trong journal và log kỹ thuật.
 
-Heartbeat tách riêng `Risk/session halt`, trạng thái feed, tổng retry/recovery của phiên và entry window tại nến cuối đã xử lý. `Risk/session halt: false` không đồng nghĩa đang trong giờ vào lệnh. Chế độ `always` hiển thị `OPEN (24/7, including weekends)`; `killzones` theo `America/New_York`, thứ Hai–thứ Sáu, có DST. Cả hai kèm thời điểm nến theo Việt Nam. Ngày 29/10/2026, riêng chế độ `killzones` có cửa sổ 13:00–16:00 và 18:00–21:00 Việt Nam. Lệnh paper đang tồn tại vẫn được mô phỏng ngoài giờ tạo entry. Discovery BTC/ETH có chẩn đoán riêng đang chờ sweep/MSS/FVG/retracement và lý do setup bị loại gần nhất (ghi rõ thời điểm, là lịch sử chứ không khẳng định lý do chờ hiện tại). Chẩn đoán chỉ đọc, không thêm trường vào journal V3 hoặc thay đổi kết quả replay.
+Mặc định mỗi 30 phút có **một tin cập nhật tổng hợp** (`--heartbeat-seconds`, tối thiểu 60), gồm:
 
-Mỗi heartbeat còn có tối đa hai tin `[PAPER] SETUP COUNTERS`, một tin cho mỗi cặp. Thống kê cộng dồn từ **nến live đầu tiên của phiên**, loại trừ warmup và batch trùng: số nến, sweep/MSS/FVG mới/displacement, intent, limit được nhận, rejection và setup bị loại theo nguyên nhân. Các tín hiệu thô có thể thuộc những setup khác nhau; nhiều FVG không đồng nghĩa có nhiều chuỗi đủ điều kiện. `Limits placed` không phải số lệnh đã khớp; `Rejection events` có thể gồm lỗi đầu vào strategy. Các bộ đếm không tác động đến quyết định, không thêm trường vào journal V3/V4 và bắt đầu lại sau restart. Tin riêng từng cặp giữ heartbeat vốn/vị thế đầy đủ dưới giới hạn độ dài Telegram; thống kê cũng được in ra console cùng nhịp heartbeat.
+- Số dư, tổng tài sản, lãi/lỗ đã ghi nhận sau phí, lãi/lỗ đang mở, phí và số lệnh đã đóng.
+- Từng lệnh **CHỜ KHỚP/ĐANG MỞ** của BTC/ETH: LONG/SHORT, Entry, TP, SL, khối lượng, rủi ro/vốn giữ chỗ; cùng số chỗ còn lại, vốn khả dụng và đòn bẩy x10. Hai lệnh cùng cặp vẫn có giá và mã riêng.
+- Trạng thái dữ liệu, lịch vào lệnh, điều kiện đang chặn lệnh mới và số lần thử lại/phục hồi. `always` xét setup 24/7; `killzones` dùng giờ New York có DST, thứ Hai–thứ Sáu. Vị thế đang có vẫn được mô phỏng ngoài giờ tạo lệnh.
+- BTC/ETH đang chờ sweep, MSS, FVG hay hồi giá; số setup đủ chuỗi, limit được nhận, lượt từ chối và nguyên nhân phổ biến nhất. Số liệu cộng dồn từ đầu phiên, bỏ warmup/nến trùng và bắt đầu lại sau restart. Tín hiệu sweep/MSS/FVG riêng lẻ không đồng nghĩa có setup đủ điều kiện; limit được nhận chưa có nghĩa đã khớp. Thống kê đầy đủ vẫn ở console, không gửi thêm hai tin riêng mỗi kỳ.
+
+Thông báo vòng đời phân biệt rõ **ĐẶT LIMIT — CHƯA KHỚP**, **ĐÃ KHỚP LỆNH MÔ PHỎNG**, **ĐÃ HỦY LIMIT CHƯA KHỚP**, **ĐÃ CHỐT TP** và **ĐÃ CẮT SL**. Tin đóng lệnh có giá thoát và lãi/lỗ ròng của chính lệnh đó; tin khởi động/dừng hoặc tạm ngừng lệnh mới không được coi là đã đóng vị thế. Toàn bộ cập nhật dựa trên nến đóng, không phải giá tick hay xác nhận khớp lệnh từ sàn.
 
 Thiết lập lần đầu bằng **bot mới dành riêng cho paper**:
 
@@ -62,7 +67,7 @@ Thiết lập lần đầu bằng **bot mới dành riêng cho paper**:
    ```
 
    Các dòng trên là placeholder, không phải giá trị dùng được. Không thêm exchange API key. Nếu chưa tạo bot, bỏ các biến này hoặc để `TELEGRAM_ENABLED=false`.
-4. Sau khi bản code mới được deploy, kiểm tra tin `[PAPER V4] STARTED`, rồi heartbeat. Tin `LIMIT PLACED / NOT FILLED` không có nghĩa đã có vị thế. Không cần mở port/domain/webhook cho notifier.
+4. Sau khi bản code mới được deploy, kiểm tra tin `[PAPER] ĐÃ KHỞI ĐỘNG`, rồi tin cập nhật. `ĐẶT LIMIT — CHƯA KHỚP` không có nghĩa đã có vị thế. Không cần mở port/domain/webhook cho notifier.
 
 Notifier có hàng đợi riêng giới hạn 64 tin, timeout và phản hồi giới hạn kích thước; lỗi gửi không làm chậm vòng xử lý nến. Chỉ retry một lần với 429 có `retry_after` hợp lệ; lỗi mạng không được tự gửi lại để tránh nhân đôi kết quả chưa rõ. Không log token/URL chứa token. Đây là **best-effort, không phải durable outbox/exactly-once**: mạng lỗi, queue đầy, crash hoặc hết thời gian shutdown có thể mất tin; JSONL mới là bằng chứng phiên. Xem lỗi và delivery counters trong console. [Telegram Bot API](https://core.telegram.org/bots/api#sendmessage)
 
@@ -78,56 +83,49 @@ Giữ volume `/data`, một instance và chính sách restart được mô tả 
 
 Sao lưu log phiên cũ; rollout tạo phiên 100 USDT mới, không tự chuyển số dư/vị thế đang có. Code mới và Variables chỉ có hiệu lực trên deployment tương ứng; việc viết code cục bộ không thay đổi service đang chạy.
 
-### Kiểm chứng thống kê setup và lịch polling (29/10/2026)
+### Kiểm chứng hiện tại (29/10/2026)
 
-- Native Windows/MSVC Rust 1.89: **484 test all-features** (414 library + 70 CLI), **378 test no-default-features** (308 + 70), Clippy all-targets `-D warnings` cả hai cấu hình và release `paper --no-default-features` đạt. Test bao phủ 60 nhịp polling × 60 thời điểm startup, heartbeat trùng mốc nến đủ điều kiện, loại warmup/nến trùng/batch lỗi khỏi thống kê, lý do từ chối thực tế và độ dài tin Telegram khi mọi bộ đếm đạt độ rộng lớn nhất.
-- Smoke release 75 giây, `poll=60`, heartbeat 60 giây, 500 batch warmup + một batch live, hai báo cáo counters tương ứng một nến live mỗi cặp, kết thúc có kiểm soát ở equity 100 USDT. Telegram tắt trong smoke. Replay V1/V2/V3/V4 và log smoke mới khớp SHA-256 với các baseline tương ứng. Báo cáo: `paper-runs/verification-20261029-observability-report.json` (Git bỏ qua).
-- Tái dựng từ public data giai đoạn 08:37–09:40 Việt Nam cho phiên V4 khởi động 08:36: BTC có 3 sweep/2 MSS/17 FVG, một intent; ETH có 5 sweep/2 MSS/20 FVG, không có intent. Các số này là tín hiệu riêng lẻ. Riêng BTC lúc **09:33**, Railway xác nhận `intents=1`, `rejected=1`, `no_opposing_liquidity`: thiếu mục tiêu thanh khoản đối diện hợp lệ để đặt TP. Tái dựng dùng metadata hiện tại, không thay thế journal gốc; không chứng minh hiệu quả giao dịch. Không thay đổi tiêu chuẩn setup, TP hoặc risk để ép phát sinh lệnh.
+Trên Rust 1.89 native Windows/MSVC:
 
-### Kiểm chứng v4 entry 24/7 (29/10/2026)
+- **518 test all-features**: 421 thư viện + 75 CLI paper + 8 backtest + 14 collector/recovery.
+- **412 test no-default-features**: 315 thư viện + 75 CLI paper + 8 backtest + 14 collector/recovery.
+- Clippy `--all-targets ... -- -D warnings` đạt ở cả hai cấu hình; release `--no-default-features` của ba binary `paper`, `paper_history`, `paper_backtest` build đạt.
+- Smoke release 75 giây với public BTC/ETH, 500 batch warmup + 2 batch mới, `poll=60`/heartbeat 60 giây và Telegram tắt: dừng có kiểm soát. Replay V1/V2/V3/V4 và log smoke mới giữ SHA-256 tương ứng; hai lần chạy báo cáo nghiên cứu cuối cho kết quả giống nhau từng byte. Bằng chứng: `paper-runs/verification-20261029-research-report.json`.
 
-- Native Windows/MSVC Rust 1.89: **474 test all-features** (410 library + 64 CLI), **368 test no-default-features** (304 + 64), Clippy all-targets `-D warnings` ở cả hai cấu hình và release `paper --no-default-features` đạt. Test gồm setup ban đêm/cuối tuần, giữ policy khi thay discovery sau mỗi intent, giới hạn risk/slot không đổi, heartbeat đúng policy, V4 replay chính xác với nhiều giao dịch ngoài killzone và từ chối policy sai/thiếu/null/bị sửa.
-- CLI `portfolio` mặc định `always`, kể cả Custom Start Command Railway cũ không có cờ giờ. `MultiPortfolio::new` của thư viện và log V3 giữ killzones để tương thích; header V4 bắt buộc lưu rõ `entry_window`. Không đổi policy khi replay bằng tham số CLI.
-- Release chạy 75 giây sau 500 batch warmup/cặp, nhận một batch mới, in `entry_window=always`, equity 100 USDT, 0 trade; Telegram tắt trong smoke. Header được kiểm tra `version=4`, `entry_window=always`; replay V4 cùng SHA-256. V1 replay khớp baseline replay cũ, V2/V3 khớp log nguồn. Bằng chứng: `paper-runs/verification-20261029-v4-always-report.json` (Git bỏ qua).
-- Kiểm thử chỉ xác nhận hành vi phần mềm, chưa đánh giá hiệu quả chế độ 24/7. Rustfmt chưa chạy lại do giới hạn môi trường đã ghi ở mốc trước; không thay đổi Windows Security. Build/runtime Railway cần xác nhận riêng sau push.
+Kiểm thử bao phủ giới hạn vốn/rủi ro/nhiều lệnh, entry 24/7 và killzone, retry/stale/deadline, thống kê setup, Telegram bốn lệnh dưới giới hạn 4.096 ký tự, dataset liên tục, phân tách thời gian và phí/PnL. Đây là kiểm chứng phần mềm cục bộ; không chứng minh lợi nhuận, độ trễ khớp lệnh hay bản triển khai Railway đã được cập nhật. Không gửi Telegram thử trong bộ kiểm tra.
 
-### Kiểm chứng giảm polling và chẩn đoán vận hành (29/10/2026)
+CLI portfolio mặc định `always`; `MultiPortfolio::new` của thư viện và log V3 giữ killzones để tương thích. Replay V1–V4 dùng đúng cấu hình được ghi trong log, không đổi policy bằng tham số CLI. Bằng chứng kiểm chứng cũ lưu trong `paper-runs/` (Git bỏ qua); không cộng kết quả các phiên khởi động mới thành một tài khoản liên tục.
 
-- Log Railway phiên `d6dca55` ghi nhận nhiều Bybit `10006` (rate limit) và hai lỗi transport trước 07:42 Việt Nam, đều có retry thành công; service vẫn Online, vốn 100 USDT, chưa có vị thế. Log cũ không phân biệt được nguyên nhân transport cụ thể; không suy đoán do IP dùng chung hay lỗi chiến lược.
-- Native Windows/MSVC Rust 1.89: **465 test all-features** (406 library + 59 CLI), **359 test no-default-features** (300 + 59), Clippy all-targets `-D warnings` ở cả hai cấu hình và release `paper --no-default-features` đều đạt. Kiểm thử bao phủ bỏ request nến trùng, dữ liệu công bố chậm, DST/giờ Việt Nam, phân biệt risk/feed/entry gate, transport timeout/connect/body, diagnostics không thay đổi quyết định và heartbeat bốn lệnh dưới giới hạn Telegram.
-- Replay v1/v2/v3 cũ đạt: v1 giữ quy ước header `mode=replay` và khớp bản replay baseline trước đó; v2/v3 khớp SHA-256 với log nguồn. Smoke release 75 giây với public BTC+ETH, 500 batch warmup + một batch mới, kết thúc có kiểm soát, equity 100 USDT, 0 trade; log mới replay khớp SHA-256. Telegram tắt trong smoke để không gửi tin thử. Bằng chứng cục bộ: `paper-runs/verification-20261029-reliability-report.json` (Git bỏ qua).
-- Các kiểm tra này xác nhận hành vi kỹ thuật, không chứng minh hiệu quả chiến lược hoặc hết mọi lỗi mạng. Chưa chạy lại rustfmt bị Windows Security chặn ở môi trường trước; không thay đổi bảo vệ hệ thống. Build/runtime Railway cần được xác nhận riêng sau push.
+### Nghiên cứu chiến lược offline
 
-### Kiểm chứng bản vá public-data
+`paper_history` thu thập nến public Bybit BTCUSDT/ETHUSDT M1 và metadata hiện tại. `paper_backtest` đọc dataset đã lưu, không gọi sàn/Telegram và không thay đổi bot đang chạy. Cả hai từ chối ghi đè đầu ra; chọn thư mục/file mới cho mỗi lần thực hiện.
 
-- Rust 1.89 native Windows/MSVC: `cargo test --all-features --locked` **456 passed** (400 library + 56 CLI/session); `--no-default-features` **350 passed** (294 + 56). Clippy `--all-targets -D warnings` ở cả hai cấu hình và Rustdoc `-D warnings`: đạt.
-- Có thêm 30 regression test so với mốc v3 bên dưới: `retCode` với result lỗi, chẩn đoán decode không lộ body, phân loại lỗi, `Retry-After`, giới hạn số lần/thời gian chờ, hủy request/backoff, timestamp mới cho cả vòng BTC+ETH, không reset account, gap/revision và deadline monotonic. Các lỗi được tạo bằng fixture/mock; chưa tái hiện nguyên phản hồi gây crash Railway trong ảnh vì phản hồi đó không được lưu.
-- Release native `--no-default-features --locked --bin paper`: build đạt. Smoke dữ liệu public 75 giây sau warmup 500 nến/cặp xử lý thêm **2 batch BTC+ETH**, dừng đúng `duration_elapsed`, balance/equity 100 USDT, 0 trade. Telegram tắt; phiên thử này không gặp lỗi upstream và không chứng minh khả năng phục hồi trên Railway hoặc hiệu quả chiến lược.
-- Replay offline v1/v2/v3 cũ thành công, không thay đổi file gốc. Log smoke mới và bản replay có cùng SHA-256; v2/v3 lịch sử cũng giữ nguyên hash khi replay. Các file dùng prefix `paper-runs/verification-public-data-8149acf82b72405091a546072c5af40f-`; file `report.json` cùng prefix lưu đường dẫn và hash đối chiếu.
-- Các kết quả ở mục này được kiểm chứng trên Windows, chưa xác nhận Docker/Linux/Railway; cần đối chiếu build/runtime log của deployment tương ứng khi phát hành. `cargo fmt --check` chưa chạy được vì rustfmt bị Windows Security chặn; không tắt bảo vệ hoặc tạo ngoại lệ.
+```powershell
+# 500 nến warmup trước cửa sổ đánh giá 29/09–29/10/2026 UTC:
+cargo run --locked --release --no-default-features --bin paper_history -- --start 2026-09-28T15:40:00Z --end 2026-10-29T00:00:00Z --output paper-runs/research-30d-new
+cargo run --locked --release --no-default-features --bin paper_backtest -- --dataset paper-runs/research-30d-new/manifest.json --split-at 2026-10-22T00:00:00Z --output paper-runs/research-30d-new/evaluation.json
+```
 
-### Kiểm chứng v3 nhiều lệnh trước bản vá public-data (28/10/2026)
+Dataset đã thu thập tại `paper-runs/research-20261029-30d/`: **43.700 nến mỗi cặp**, gồm 500 nến warmup và 30 ngày đánh giá `[29/09/2026 00:00, 29/10/2026 00:00)` UTC. Chia theo thời gian thành 23 ngày phát triển và 7 ngày kiểm tra sau cùng (holdout). Mỗi phần có tài khoản 100 USDT độc lập và chỉ warmup bằng 500 nến trước nó; không cộng dồn lợi nhuận của hai phần.
 
-- Native `cargo test --all-features --locked`: **426 passed** (392 library + 34 CLI/session); `--no-default-features`: **320 passed** (286 + 34). Clippy `--all-targets -D warnings` ở cả hai cấu hình và Rustdoc `-D warnings`: đạt.
-- Fixture nến đi qua **ICT/strategy mặc định** chứng minh hai setup BTC độc lập, Entry khác nhau và cùng mở; stop hoặc expiry của lệnh thứ hai không tác động lệnh thứ nhất; setup BTC thứ ba bị `symbol_slots`. Test book kiểm tra 4 lệnh được cấp vốn thật từ cùng 100 USDT, giới hạn tổng 3%, risk có phí/slippage, không dùng PnL chưa chốt để mở thêm, giao dịch/cancel nguyên tử và không hoàn tiền hai lần khi replay.
-- Log v3 có fixture BTC+ETH cùng vào, BTC TP trước khi ETH SL; replay chính xác và từ chối sửa ID/TP/trạng thái/reservation hoặc bỏ mất một lệnh. Telegram formatter kiểm tra bốn lệnh trong một heartbeat, hai BTC có Entry khác nhau và giới hạn 4096 ký tự; không gửi tin thật trong các test này.
-- Release native Windows/MSVC, Rust 1.89, `--no-default-features --locked --bin paper`: build đạt. Chạy public-data 75 giây sau 500 batch warmup, xử lý thêm một batch BTC/ETH đồng bộ, dừng đúng `duration_elapsed`; 0 trade, balance/equity vẫn 100 USDT. Telegram tắt trong smoke test này để không gửi tin thử vào chat thật.
-- Log `paper-runs/verification-20261028-multi-v3-native.jsonl` replay offline thành `verification-20261028-multi-v3-replayed.jsonl`; hai file có cùng SHA-256. Phiên ngắn này chỉ kiểm tra kết nối/runner/log, **không đánh giá lợi nhuận, win rate hay chứng minh có nhiều setup ngoài thị trường**.
-- Binary mới cũng replay thành công hai log v1/v2 cũ; output riêng `verification-20261028-v1-after-multi-v3.jsonl` và `verification-20261028-v2-after-multi-v3.jsonl`. Không ghi đè dữ liệu gốc.
-- Chưa xác nhận Docker/Linux/Railway cho thay đổi này, chưa chạy lại `cargo fmt --check` do rustfmt bị Windows Security chặn như ghi chú bên dưới. Không tắt bảo vệ để chạy formatter. Thay đổi source không tự cập nhật deployment.
+Bộ đánh giá so sánh sáu cấu hình cố định: `always`/`killzones` theo chiến lược hiện tại ở hai mức chi phí, cùng một giả thuyết chọn TP dành riêng cho nghiên cứu ở hai mức chi phí. Giả thuyết `nearest_viable` xét mục tiêu thanh khoản đối diện đã xác nhận tiếp theo chỉ khi mục tiêu gần nhất không đạt RR trước/sau chi phí; không thử mục tiêu xa hơn để vượt lỗi thiếu vốn, khối lượng hoặc số lệnh. Vẫn giữ setup, x10, risk 1%/3%, giới hạn 4/2 lệnh và net RR ≥ 2. **Giả thuyết này chưa được chọn làm chiến lược chạy thực tế của PAPER.**
 
-### Kiểm chứng bản v2 trước mở rộng nhiều lệnh (28/10/2026)
+Kết quả trong `paper-runs/research-20261029-30d/evaluation-final.json` dưới đây là thay đổi **tổng tài sản sau phí, đơn vị USDT**, không phải lợi nhuận tiền thật:
 
-Rust 1.89 native Windows/MSVC, không dùng credentials sàn:
+| Cấu hình 24/7 | Phát triển: số lệnh đóng / thay đổi tài sản | Holdout: số lệnh đóng / thay đổi tài sản |
+| --- | ---: | ---: |
+| Hiện tại, phí 6 bps mỗi chiều + stop slippage 2 bps | 1 lệnh lỗ / −0.95922440 | 0 / 0 |
+| Nghiên cứu `nearest_viable`, chi phí 6/2 bps | 50 / −17.69644042 | 10 / +6.6100374 |
+| Nghiên cứu `nearest_viable`, chi phí tăng lên 10/5 bps | 47 / −25.3356977 | 9 / +0.6855311 |
 
-- `cargo test --all-features --locked`: **384 passed** (361 library + 23 CLI/session).
-- `cargo test --no-default-features --locked`: **278 passed** (255 library + 23 CLI/session).
-- Clippy `--all-targets -D warnings` ở cả hai cấu hình, Rustdoc `-D warnings`, release build `paper --no-default-features`: đạt.
-- Các test kiểm tra vốn chung, risk 1%, margin x10 không nhân lại PnL, chuyển BTC→ETH, global busy, daily rollover/insolvency, fill+SL cùng nến, log v2 có trade thật trong fixture, dữ liệu bị sửa, aborted session, shutdown startup và tin Entry/TP/SL. Telegram transport dùng mock HTTP; **chưa gửi tin tới bot/chat thật**.
-- Replay file v1 cũ `verification-20261028-live-100usdt.jsonl` bằng binary mới vẫn khớp; output riêng `verification-20261028-v1-after-portfolio.jsonl`, không sửa bản gốc.
-- Lần smoke đầu phát hiện close/volume REST thay đổi sau ranh giới phút và dừng an toàn, không trade; log giữ tại `paper-runs/verification-20261028-portfolio-x10-native.jsonl`. Khoảng chờ 10 giây được bổ sung riêng cho portfolio; không nới kiểm tra revision của nến đã chấp nhận.
-- Chạy lại release binary **185 giây** sau warmup 500 nến/cặp: xử lý 3 batch M1 mới (BTC+ETH), kết thúc đúng `duration_elapsed`, balance/equity vẫn 100 USDT, 0 trade. Replay offline khớp toàn bộ phiên; log `verification-20261028-portfolio-x10-settled.jsonl` và `verification-20261028-portfolio-x10-replayed.jsonl` trong `paper-runs/`. Đây chỉ là smoke test kết nối/đồng bộ, không phải đánh giá hiệu quả chiến lược.
-- **Chưa kiểm chứng build Linux/Docker mới**: Docker/WSL trên máy đang kẹt. `cargo fmt --check` chưa chạy vì Windows Security chặn archive rustfmt 1.89; không tắt bảo vệ hoặc thêm ngoại lệ. Toolchain kiểm thử riêng nằm trong `target/verify-tools/` (Git bỏ qua), không đổi PATH hệ thống. Cần chạy lại fmt và Docker build sau khi môi trường được xử lý, trước khi xác nhận release Railway.
+Holdout `nearest_viable` ở mức phí 6/2 còn **một vị thế mở**: +6.6100374 bao gồm định giá vị thế này theo nến cuối, không phải toàn bộ lãi đã chốt. Các cấu hình killzone và cấu hình hiện tại với chi phí tăng không có giao dịch trong mẫu này. Giao dịch nhiều hơn đi kèm thua lỗ đáng kể ở tập phát triển; holdout dương với 9–10 giao dịch chưa chứng minh lợi thế bền vững. Mọi báo cáo giữ trạng thái **`UNVALIDATED`**, không tự điều chỉnh hoặc đưa chiến lược nghiên cứu lên Railway.
+
+Báo cáo lưu hash dataset, cấu hình và mã nguồn được biên dịch để đối chiếu. Các giới hạn khi đọc kết quả:
+
+- Tick/step/minimum dùng metadata tại lúc thu thập, có thể khác metadata lịch sử. Phí/slippage là giả định kiểm tra, chưa xác minh theo fee tier tài khoản.
+- Chưa mô phỏng funding, thanh lý, mark-price maintenance margin, hàng đợi lệnh, khớp một phần hoặc tác động thị trường. Drawdown chỉ đo ở giá đóng nến.
+- Chưa mô phỏng độ trễ chờ REST ổn định, polling và nhận lệnh: OHLC nến kế tiếp có thể chứa giá xuất hiện trước lúc bot thực sự nhận setup. PAPER/backtest không chứng minh khả năng khớp lệnh thực tại những giá đó.
+- So sánh nhiều cấu hình trên cùng holdout không tạo ra kiểm chứng độc lập cho cấu hình được chọn. Cần thêm dữ liệu chưa dùng, đánh giá qua nhiều trạng thái thị trường và forward paper trước khi thay chiến lược đang chạy.
 
 ## Chế độ cũ: PAPER đơn cặp, 1x, không cần API key
 
@@ -172,19 +170,6 @@ Các giả định cần hiểu trước khi đánh giá kết quả:
 - Killzone mặc định theo `America/New_York`, có DST, thứ Hai đến thứ Sáu. Không có setup hợp lệ có thể dẫn đến **0 giao dịch**; CLI không tạo tín hiệu để ép có lệnh.
 - Metadata lấy từ public endpoint, không dùng filter hard-code khi request thất bại. Nến phải liên tục, đúng symbol/timeframe và chính xác Decimal; chỉ coi là đóng khi cả đồng hồ local và timestamp phản hồi Bybit đã qua ranh giới nến. Thiếu server time hoặc lệch local/server quá 10 giây làm dừng phiên; cần đồng bộ đồng hồ hệ thống. Lỗi dữ liệu hoặc transport không tự retry vô hạn.
 - Fill dùng quy tắc mô phỏng từ OHLC nến đóng, không có tick/order book, queue priority hay partial fill; chưa mô hình hóa funding, margin/liquidation. Poll 5 giây không phải execution low-latency; kết quả PAPER không chứng minh lợi nhuận hoặc chất lượng khớp lệnh thật.
-
-### Kiểm chứng phiên bản PAPER đơn cặp trước thay đổi portfolio (28/10/2026)
-
-Trên Rust 1.89, Linux container qua Docker Desktop Windows:
-
-- `cargo test --all-features --locked`: **333 passed** (326 library + 7 CLI/session).
-- `cargo test --no-default-features --locked`: **227 passed** (220 library + 7 CLI/session).
-- `cargo fmt --all -- --check`, Clippy `--all-targets` với `-D warnings` ở cả hai cấu hình trên, Rustdoc `-D warnings` và release build: đạt.
-- Đã chạy release binary với public Bybit ETHUSDT M1 trong **75 giây** sau 500 nến warmup: thêm 1 nến đóng, 1 tín hiệu detector, 0 entry intent, 0 giao dịch; balance/equity cuối cùng **100 USDT**, phí/PnL bằng 0. Đây chỉ là smoke test, chưa phải mẫu thống kê đánh giá chiến lược.
-- Replay offline đối chiếu thành công toàn bộ phiên trên. Một phiên riêng kiểm tra `SIGTERM` cũng ghi được summary và replay thành công. Các test fixture riêng có giao dịch hoàn tất kiểm tra fill, phí, profit/loss và định danh qua replay; không gán kết quả fixture cho thị trường thật.
-- Đã kiểm tra cú pháp `scripts/paper.ps1`. Chưa xác nhận native Windows build hoặc chạy end-to-end wrapper với cache Docker mới; lần đầu có thể phải tải dependencies/build.
-
-Log kiểm chứng cục bộ: `paper-runs/verification-20261028-live-100usdt.jsonl`, bản replay `paper-runs/verification-20261028-live-replayed.jsonl`; phiên kiểm tra dừng nằm ở hai file `verification-20261028-sigterm-*.jsonl`. Các phiên này đã dừng, không có bot chạy ngầm. Không dùng API tài khoản hay gửi lệnh demo/tiền thật.
 
 ## Deploy PAPER lên Railway
 
@@ -361,16 +346,6 @@ cargo test --all-features --locked paper
 ```
 
 Test bao phủ invariant của model, ICT, strategy/risk lifecycle, exact-decimal arithmetic, chữ ký, protocol parsing, cumulative/partial fill, cancellation race và transport giả lập. Bộ test durability bổ sung restart, claim/receipt, bảo toàn reservation/tombstone, recovery không replay lệnh, corrupt checkpoint, khóa file, torn tail và giới hạn dung lượng. Bộ test inventory dùng response/mock transport để kiểm tra ký GET, scope/filter, mode chưa rõ, pagination, hủy/deadline, giới hạn và so sánh order không làm thay đổi risk/entry. Mock test và release build không xác nhận latency thực tế, hành vi khớp lệnh hoặc độ tin cậy trên hạ tầng của sàn.
-
-Mốc kiểm chứng **trước khi bổ sung PAPER**, sau inventory scanner và đối chiếu durable outbox, ngày 28/10/2026 trên Rust/Cargo 1.89.0, Linux container `rust:1.89-bookworm` qua Docker Desktop Windows. Các số dưới đây là mốc lịch sử; kết quả bản PAPER hiện tại nằm ở mục “Kiểm chứng PAPER ngày 28/10/2026” phía trên:
-
-- `cargo test --all-features --locked`: **286 passed**, không có test thất bại hoặc bị bỏ qua.
-- `cargo test --no-default-features --locked`: **180 passed**, không có test thất bại hoặc bị bỏ qua.
-- Clippy `--all-targets ... -- -D warnings`: đạt ở cả `--all-features` và `--no-default-features`.
-- `cargo clippy --all-targets --no-default-features --features <sàn> --locked -- -D warnings`: đạt riêng từng feature `binance`, `bybit`, `okx`.
-- `cargo fmt --all -- --check`, Rustdoc với `RUSTDOCFLAGS="-D warnings"` và `cargo build --release --all-features --locked`: đạt.
-
-So với mốc durability trước (244/170), cấu hình đầy đủ có thêm 42 test và cấu hình không bật adapter có thêm 10 test. Các test mới gồm 25 test adapter, 10 test collector/so sánh/durable integration và 7 test HTTP giả lập sử dụng adapter thật. Đây là kiểm chứng build/test Linux, không phải native Windows build, benchmark latency, native Windows durability hoặc demo/live E2E; không gọi API tài khoản riêng của sàn và không đặt lệnh thật.
 
 ## Phần cần hoàn thiện trước vận hành thực tế
 

@@ -45,6 +45,29 @@ pub enum PaperEntryWindow {
     Always,
 }
 
+/// Explicit target-selection hypothesis available only to research callers.
+///
+/// Live CLI sessions and every historical journal keep [`Self::Nearest`]. The
+/// alternative does not claim profitability or change the available liquidity,
+/// fee model, entry timing, minimum RR, account risk or order-slot limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperTargetPolicy {
+    /// Historical behavior: assess only the nearest opposing liquidity level.
+    #[default]
+    Nearest,
+    /// Research hypothesis: try farther existing levels only after RR rejection.
+    NearestViable,
+}
+
+impl PaperTargetPolicy {
+    /// Stable research configuration name; not a live CLI parameter.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self { Self::Nearest => "nearest", Self::NearestViable => "nearest_viable" }
+    }
+}
+
 impl PaperEntryWindow {
     /// Stable CLI and journal value for this policy.
     #[must_use]
@@ -354,6 +377,27 @@ impl SymbolState {
                     }, swing.price(), swing.confirmed_at())
             }).transpose()
     }
+
+    fn research_targets(&self, intent: &TradeIntent, at: DateTime<Utc>) -> Result<Vec<LiquidityTarget>, RiskError> {
+        let mut swings: Vec<_> = self.liquidity.iter().filter(|swing| swing.confirmed_at() <= at)
+            .filter(|swing| match intent.direction() {
+                Direction::Bullish => swing.kind() == SwingKind::High && swing.price() > intent.entry_price(),
+                Direction::Bearish => swing.kind() == SwingKind::Low && swing.price() < intent.entry_price(),
+            }).collect();
+        swings.sort_by(|left, right| match intent.direction() {
+            Direction::Bullish => left.price().cmp(&right.price()),
+            Direction::Bearish => right.price().cmp(&left.price()),
+        });
+        swings.into_iter().map(|swing| {
+            let identity = format!("paper-multi-liquidity:{:?}:{:?}:{}:{}", self.key,
+                swing.kind(), swing.candle_open_time(), swing.price().normalize());
+            LiquidityTarget::new(Uuid::new_v5(&Uuid::NAMESPACE_OID, identity.as_bytes()),
+                self.key.instrument.clone(), match swing.kind() {
+                    SwingKind::High => LiquiditySide::BuySide,
+                    SwingKind::Low => LiquiditySide::SellSide,
+                }, swing.price(), swing.confirmed_at())
+        }).collect()
+    }
 }
 
 /// The actual strategy that produced one intent, never a synthetic replacement.
@@ -377,6 +421,7 @@ pub struct MultiPortfolio {
     consumed_fvg: BTreeSet<(CandleKey, Uuid)>,
     timeframe: Timeframe,
     entry_window: PaperEntryWindow,
+    target_policy: PaperTargetPolicy,
     risk: RiskManager,
     book: PaperBook,
     history: BTreeMap<DateTime<Utc>, Vec<Candle>>,
@@ -403,6 +448,22 @@ impl MultiPortfolio {
     /// Rejects unsupported/duplicate instruments, non-M1 input and bad metadata.
     pub fn new_with_entry_window(instruments: Vec<PaperInstrument>, config: PaperConfig,
         timeframe: Timeframe, entry_window: PaperEntryWindow) -> Result<Self, MultiPortfolioError> {
+        Self::new_for_research(instruments, config, timeframe, entry_window, PaperTargetPolicy::Nearest)
+    }
+
+    /// Creates an explicit research engine without changing live/replay defaults.
+    ///
+    /// `NearestViable` considers only confirmed, unswept liquidity already known
+    /// at entry time. Each candidate stages risk and book admission, committing
+    /// only the first success. Only gross/net RR failures permit trying farther
+    /// targets; cash, sizing, direction, slot and risk failures stop the search.
+    /// This hypothesis requires independent evaluation before live promotion.
+    ///
+    /// # Errors
+    /// Rejects unsupported/duplicate instruments, non-M1 input and bad metadata.
+    pub fn new_for_research(instruments: Vec<PaperInstrument>, config: PaperConfig,
+        timeframe: Timeframe, entry_window: PaperEntryWindow, target_policy: PaperTargetPolicy,
+    ) -> Result<Self, MultiPortfolioError> {
         if instruments.is_empty() || instruments.len() > 2 || timeframe != Timeframe::M1 {
             return Err(PortfolioError::Configuration("expected one or two M1 instruments").into());
         }
@@ -430,13 +491,17 @@ impl MultiPortfolio {
             }
         }
         Ok(Self { symbols, owners: BTreeMap::new(), consumed_mss: BTreeSet::new(),
-            consumed_fvg: BTreeSet::new(), timeframe, entry_window, risk, book: PaperBook::new(config)?,
+            consumed_fvg: BTreeSet::new(), timeframe, entry_window, target_policy, risk, book: PaperBook::new(config)?,
             history: BTreeMap::new(), phase: Phase::WarmingUp, insolvent: false })
     }
 
     /// Returns the policy retained by this session and all fresh discoveries.
     #[must_use]
     pub const fn entry_window(&self) -> PaperEntryWindow { self.entry_window }
+
+    /// Reports the explicit research policy; ordinary sessions return `Nearest`.
+    #[must_use]
+    pub const fn target_policy(&self) -> PaperTargetPolicy { self.target_policy }
 
     /// Initializes symbol contexts without creating historical orders or fills.
     ///
@@ -718,6 +783,9 @@ impl MultiPortfolio {
         if self.owners.contains_key(&intent.id()) {
             return Err(PortfolioError::Invariant("intent identifier already has an owner").into());
         }
+        if self.target_policy == PaperTargetPolicy::NearestViable {
+            return self.submit_research_target(symbol, intent, owner, candle, events);
+        }
         let Some(target) = self.state(symbol)?.nearest_target(intent, at)? else {
             Self::reject_owner(&mut owner, intent.id(), at)?;
             return Ok(Some(MultiRejection::NoOpposingLiquidity));
@@ -754,6 +822,61 @@ impl MultiPortfolio {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn submit_research_target(&mut self, symbol: &str, intent: &TradeIntent, mut owner: IntentOwner,
+        candle: &Candle, events: &mut Vec<PortfolioEvent>,
+    ) -> Result<Option<MultiRejection>, MultiPortfolioError> {
+        let at = candle.close_time();
+        let state = self.state(symbol)?;
+        let targets = state.research_targets(intent, at)?;
+        let instrument = state.instrument.clone();
+        let mut rejection = MultiRejection::NoOpposingLiquidity;
+        for target in targets {
+            // A failed trial must not reserve this intent ID, leave an approval
+            // tombstone, consume margin, or prevent assessing the next target.
+            let mut risk = self.risk.clone();
+            let assessment = match risk.assess_trade(intent, &target, at) {
+                Ok(assessment) => assessment,
+                Err(RiskError::MinimumRiskRewardNotMet { .. }) => {
+                    rejection = MultiRejection::RiskRule;
+                    continue;
+                }
+                Err(error) if is_entry_rejection(&error) => {
+                    rejection = if error == RiskError::PortfolioRiskLimitReached { MultiRejection::PortfolioRisk }
+                        else { MultiRejection::RiskRule };
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let TradeAssessment::Approved(plan) = assessment else {
+                return Err(PortfolioError::Invariant("unexpected research risk replay after setup deduplication").into());
+            };
+            let mut book = self.book.clone();
+            match book.admit(&instrument, *plan, candle) {
+                Ok(placed) => {
+                    if !matches!(placed.as_slice(), [PortfolioEvent::EntryPlaced { symbol: placed_symbol, at: placed_at, order }]
+                        if placed_symbol == symbol && *placed_at == at && order.intent_id == intent.id()) {
+                        return Err(PortfolioError::Invariant("research admission did not create exactly one resting entry").into());
+                    }
+                    self.risk = risk;
+                    self.book = book;
+                    self.owners.insert(intent.id(), owner);
+                    events.extend(placed);
+                    return Ok(None);
+                }
+                Err(BookError::Broker(PaperError::NetRiskReward)) => {
+                    rejection = MultiRejection::NetRiskReward;
+                }
+                Err(error) if error.is_rejection() => {
+                    rejection = book_rejection(&error);
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Self::reject_owner(&mut owner, intent.id(), at)?;
+        Ok(Some(rejection))
     }
 
     fn reject_owner(owner: &mut IntentOwner, intent_id: Uuid, at: DateTime<Utc>) -> Result<(), PortfolioError> {
@@ -918,6 +1041,144 @@ mod tests {
         }
         assert_eq!(engine.snapshot().account.orders.len(), 2);
         Ok(engine)
+    }
+
+    fn research_portfolio(policy: PaperTargetPolicy, config: PaperConfig) -> Result<MultiPortfolio, Box<dyn Error>> {
+        Ok(MultiPortfolio::new_for_research(vec![metadata("ETHUSDT")?, metadata("BTCUSDT")?],
+            config, Timeframe::M1, PaperEntryWindow::Always, policy)?)
+    }
+
+    fn two_targets(near: i64, far: i64) -> Vec<[i64; 4]> {
+        let mut prices = setup(far);
+        // Both highs form strict five-candle swings before the later sweep.
+        // Neither is invented when the entry is assessed.
+        prices[6] = [100, near, 98, 101];
+        prices
+    }
+
+    fn run_target_setup(engine: &mut MultiPortfolio, prices: &[[i64; 4]]) -> Result<MultiPortfolioStep, Box<dyn Error>> {
+        let mut final_step = None;
+        for (index, bar) in prices.iter().enumerate() {
+            final_step = Some(engine.process_batch(&batch(i64::try_from(index)?, *bar, NEUTRAL)?)?);
+        }
+        final_step.ok_or_else(|| "empty target fixture".into())
+    }
+
+    #[test]
+    fn research_nearest_preserves_the_normal_constructor_and_all_serialized_steps() -> TestResult {
+        let config = PaperConfig::default().with_leverage(10)?;
+        let mut ordinary = MultiPortfolio::new_with_entry_window(vec![metadata("BTCUSDT")?, metadata("ETHUSDT")?],
+            config, Timeframe::M1, PaperEntryWindow::Always)?;
+        let mut explicit = research_portfolio(PaperTargetPolicy::Nearest, config)?;
+        assert_eq!(ordinary.target_policy(), PaperTargetPolicy::Nearest);
+        assert_eq!(portfolio()?.target_policy(), PaperTargetPolicy::Nearest);
+        for (index, prices) in two_targets(120, 150).into_iter().enumerate() {
+            let candles = batch(i64::try_from(index)?, prices, NEUTRAL)?;
+            assert_eq!(serde_json::to_value(ordinary.process_batch(&candles)?)?,
+                serde_json::to_value(explicit.process_batch(&candles)?)?);
+        }
+        assert!(ordinary.snapshot().account.orders.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn research_can_choose_farther_existing_liquidity_after_gross_rr_rejection() -> TestResult {
+        let config = PaperConfig::default().with_leverage(10)?;
+        let mut nearest = research_portfolio(PaperTargetPolicy::Nearest, config)?;
+        let mut viable = research_portfolio(PaperTargetPolicy::NearestViable, config)?;
+        let prices = two_targets(120, 150);
+        let baseline = run_target_setup(&mut nearest, &prices)?;
+        let candidate = run_target_setup(&mut viable, &prices)?;
+        assert_eq!(baseline.analysis[0].rejection_reasons, [MultiRejection::RiskRule]);
+        assert_eq!(baseline.analysis[0].intents, 1);
+        assert_eq!(candidate.analysis[0].intents, 1);
+        assert_eq!(candidate.analysis[0].rejected, 0);
+        let [order] = candidate.snapshot.account.orders.as_slice() else { return Err("expected one research entry".into()); };
+        assert_eq!(order.order.take_profit_price, Decimal::from(150));
+        assert_eq!(order.state, BookOrderState::Pending);
+        assert!(order.reserved_risk <= Decimal::ONE);
+        assert_eq!(viable.risk.active_reserved_risk()?, order.reserved_risk);
+        assert_eq!(candidate.snapshot.account.balance, Decimal::from(100));
+        let entry_at = at(25)?;
+        assert!(viable.state("BTCUSDT")?.liquidity.iter().any(|swing| swing.kind() == SwingKind::High
+            && swing.price() == Decimal::from(150) && swing.confirmed_at() <= entry_at));
+        Ok(())
+    }
+
+    #[test]
+    fn research_retries_fee_adjusted_rr_without_retaining_failed_approval() -> TestResult {
+        // An elevated but valid fee assumption makes the near 135 target pass
+        // gross RR and fail the broker's actual net RR check.
+        let config = PaperConfig::new(Decimal::from(100), Decimal::new(2, 3), Decimal::TWO,
+            Decimal::ONE, Decimal::TWO)?.with_leverage(10)?;
+        let mut nearest = research_portfolio(PaperTargetPolicy::Nearest, config)?;
+        let mut viable = research_portfolio(PaperTargetPolicy::NearestViable, config)?;
+        let prices = two_targets(135, 150);
+        let baseline = run_target_setup(&mut nearest, &prices)?;
+        let candidate = run_target_setup(&mut viable, &prices)?;
+        assert_eq!(baseline.analysis[0].rejection_reasons, [MultiRejection::NetRiskReward]);
+        let [order] = candidate.snapshot.account.orders.as_slice() else { return Err("expected fee-eligible target".into()); };
+        assert_eq!(order.order.take_profit_price, Decimal::from(150));
+        assert_eq!(viable.risk.reservation_status(order.order.intent_id), Some(ReservationStatus::Pending));
+        assert_eq!(viable.owners.len(), 1);
+        assert_eq!(viable.risk.active_reserved_risk()?, order.reserved_risk);
+        assert!(order.reserved_risk <= Decimal::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn research_without_a_viable_target_leaves_cash_and_reservations_unchanged() -> TestResult {
+        for (prices, remove_liquidity, expected) in [
+            (two_targets(120, 125), false, MultiRejection::RiskRule),
+            (two_targets(120, 150), true, MultiRejection::NoOpposingLiquidity),
+        ] {
+            let mut engine = research_portfolio(PaperTargetPolicy::NearestViable,
+                PaperConfig::default().with_leverage(10)?)?;
+            let mut final_step = None;
+            for (index, prices) in prices.iter().enumerate() {
+                // Model an empty retained target set at the actual entry; the
+                // strategy still has a real previously armed MSS/FVG setup.
+                if remove_liquidity && index == 24 { engine.state_mut("BTCUSDT")?.liquidity.clear(); }
+                final_step = Some(engine.process_batch(&batch(i64::try_from(index)?, *prices, NEUTRAL)?)?);
+            }
+            let step = final_step.ok_or("missing target rejection")?;
+            assert_eq!(step.analysis[0].intents, 1);
+            assert_eq!(step.analysis[0].rejection_reasons, [expected]);
+            assert_eq!(step.snapshot.account.balance, Decimal::from(100));
+            assert_eq!(step.snapshot.account.available_cash, Decimal::from(100));
+            assert_eq!(engine.risk.active_reserved_risk()?, Decimal::ZERO);
+            assert!(step.snapshot.account.orders.is_empty() && engine.owners.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn research_does_not_override_cash_minimum_or_symbol_slots() -> TestResult {
+        // A real setup with a valid TP still cannot consume more than the
+        // configured cash cap, even if a farther price exists.
+        let config = PaperConfig::new(Decimal::from(100), Decimal::new(6, 4), Decimal::TWO,
+            Decimal::new(1, 6), Decimal::TWO)?.with_leverage(10)?;
+        let mut cash_limited = research_portfolio(PaperTargetPolicy::NearestViable, config)?;
+        let rejected = run_target_setup(&mut cash_limited, &two_targets(150, 200))?;
+        assert_eq!(rejected.analysis[0].rejection_reasons, [MultiRejection::MinimumOrder]);
+        assert_eq!(cash_limited.risk.active_reserved_risk()?, Decimal::ZERO);
+        assert_eq!(rejected.snapshot.account.balance, Decimal::from(100));
+        assert!(rejected.snapshot.account.orders.is_empty());
+
+        let mut slots = ready_two_btc()?;
+        slots.target_policy = PaperTargetPolicy::NearestViable;
+        slots.process_batch(&batch(52, [159, 160, 153, 159], NEUTRAL)?)?;
+        let reserved = slots.risk.active_reserved_risk()?;
+        let mut final_step = None;
+        for (index, prices) in subsequent_setup(400, 100).into_iter().enumerate() {
+            final_step = Some(slots.process_batch(&batch(53 + i64::try_from(index)?, prices, NEUTRAL)?)?);
+        }
+        let rejected = final_step.ok_or("missing slot rejection")?;
+        assert_eq!(rejected.analysis[0].rejection_reasons, [MultiRejection::SymbolSlots]);
+        assert_eq!(slots.risk.active_reserved_risk()?, reserved);
+        assert_eq!(slots.owners.len(), 2);
+        assert_eq!(rejected.snapshot.account.orders.len(), 2);
+        Ok(())
     }
 
     fn portfolio_with_window(entry_window: PaperEntryWindow) -> Result<MultiPortfolio, Box<dyn Error>> {

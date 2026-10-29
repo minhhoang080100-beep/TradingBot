@@ -130,6 +130,44 @@ impl PublicPaperMarket {
         Ok(candles)
     }
 
+    /// Reads a bounded historical page from `[start, end)` using public data.
+    ///
+    /// Returned bars are ascending and validated, but a short page is allowed.
+    /// Callers must paginate and verify complete coverage before evaluating a
+    /// strategy. `observed_at` is the current request time, not historical time.
+    /// Current instrument metadata does not describe past venue rule changes.
+    ///
+    /// # Errors
+    /// Rejects unaligned/future intervals, unsupported identities, bad limits,
+    /// malformed data, clock skew or rows outside the requested interval.
+    pub async fn historical_closed_candles(&self, instrument: &InstrumentId, timeframe: Timeframe,
+        start: DateTime<Utc>, end: DateTime<Utc>, limit: u16, observed_at: DateTime<Utc>,
+    ) -> Result<Vec<Candle>, PaperMarketError> {
+        validate_instrument_identity(instrument)?;
+        if !(1..=1000).contains(&limit) { return Err(PaperMarketError::InvalidLimit); }
+        let interval = timeframe.duration().num_milliseconds();
+        if start.timestamp_millis() < 0 || start >= end || end > observed_at
+            || start.timestamp_subsec_nanos() != 0 || end.timestamp_subsec_nanos() != 0
+            || start.timestamp_millis().rem_euclid(interval) != 0
+            || end.timestamp_millis().rem_euclid(interval) != 0 {
+            return Err(PaperMarketError::InvalidTime);
+        }
+        let (status, body) = self.get("/v5/market/kline", &[
+            ("category", "linear".to_owned()),
+            ("symbol", instrument.venue_symbol.as_str().to_owned()),
+            ("interval", wire_interval(timeframe).to_owned()),
+            ("start", start.timestamp_millis().to_string()),
+            ("end", (end.timestamp_millis() - 1).to_string()),
+            ("limit", limit.to_string()),
+        ]).await?;
+        let candles = parse_closed_candles(instrument, timeframe, observed_at, status, &body)?;
+        if candles.len() > usize::from(limit) || candles.iter().any(|candle|
+            candle.open_time() < start || candle.close_time() > end) {
+            return Err(PaperMarketError::InvalidCandles);
+        }
+        Ok(candles)
+    }
+
     async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<(u16, Vec<u8>), PaperMarketError> {
         let mut response = self
             .client
@@ -1362,6 +1400,46 @@ mod tests {
             assert!(!request.headers.contains_key("x-bapi-api-key"));
             assert!(!request.headers.contains_key("x-bapi-sign"));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_page_uses_historical_bounds_and_current_clock_without_auth() -> TestResult {
+        let server = MockServer::start().await;
+        let market = PublicPaperMarket::local(server.uri())?;
+        Mock::given(method("GET")).and(path("/v5/market/kline"))
+            .and(query_param("category", "linear")).and(query_param("symbol", "BTCUSDT"))
+            .and(query_param("interval", "1")).and(query_param("limit", "2"))
+            .and(query_param("start", at(0)?.timestamp_millis().to_string()))
+            .and(query_param("end", (at(2)?.timestamp_millis() - 1).to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(klines(vec![row(1)?, row(0)?], at(500)?)))
+            .expect(1).mount(&server).await;
+        let bars = market.historical_closed_candles(&instrument()?, Timeframe::M1, at(0)?, at(2)?, 2, at(500)?).await?;
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[0].open_time(), at(0)?);
+        assert_eq!(bars[1].close_time(), at(2)?);
+        for request in server.received_requests().await.ok_or("request capture")? {
+            assert!(!request.headers.contains_key("authorization"));
+            assert!(!request.headers.contains_key("x-bapi-api-key"));
+            assert!(!request.headers.contains_key("x-bapi-sign"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn historical_page_rejects_bad_ranges_before_network_and_out_of_range_rows() -> TestResult {
+        let server = MockServer::start().await;
+        let market = PublicPaperMarket::local(server.uri())?;
+        for (start, end, limit) in [(at(2)?, at(1)?, 2), (at(0)?, at(501)?, 2),
+            (at(0)? + chrono::Duration::seconds(1), at(2)?, 2), (at(0)?, at(2)?, 0)] {
+            assert!(market.historical_closed_candles(&instrument()?, Timeframe::M1, start, end, limit, at(500)?).await.is_err());
+        }
+        assert!(server.received_requests().await.ok_or("request capture")?.is_empty());
+        Mock::given(method("GET")).and(path("/v5/market/kline"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(klines(vec![row(0)?], at(500)?)))
+            .expect(1).mount(&server).await;
+        assert_eq!(market.historical_closed_candles(&instrument()?, Timeframe::M1, at(1)?, at(2)?, 2, at(500)?).await,
+            Err(PaperMarketError::InvalidCandles));
         Ok(())
     }
 
