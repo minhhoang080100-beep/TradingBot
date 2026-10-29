@@ -44,6 +44,29 @@ pub enum StrategyState {
     InPosition,
 }
 
+/// Read-only detail of the current strategy phase, without changing decisions.
+///
+/// A stage explains which evidence is still awaited; it is not a prediction
+/// that the next candle will qualify or that an order will be accepted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StrategyStage {
+    /// No usable setup is retained; a new liquidity sweep is required.
+    #[default]
+    WaitingForSweep,
+    /// A sweep is retained, awaiting a qualifying displacement and MSS.
+    WaitingForMss,
+    /// A qualifying MSS is retained, awaiting its following-candle FVG.
+    WaitingForFvg,
+    /// An FVG is armed, awaiting a valid retracement during the entry window.
+    WaitingForRetracement,
+    /// Execution has not yet confirmed the generated entry intent.
+    EntryPending,
+    /// Execution has not yet acknowledged cancellation of the entry intent.
+    CancellationPending,
+    /// Execution confirmed an open position owned by this strategy.
+    InPosition,
+}
+
 /// How the New York/London session classification affects entries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum KillzonePolicy {
@@ -365,6 +388,18 @@ impl SeriesPhase {
             Self::Position(_) => StrategyState::InPosition,
         }
     }
+
+    const fn stage(&self) -> StrategyStage {
+        match self {
+            Self::Idle => StrategyStage::WaitingForSweep,
+            Self::Swept(_) => StrategyStage::WaitingForMss,
+            Self::Impulse(_) => StrategyStage::WaitingForFvg,
+            Self::Armed(_) => StrategyStage::WaitingForRetracement,
+            Self::IntentPending(_) => StrategyStage::EntryPending,
+            Self::CancelRequested(_) => StrategyStage::CancellationPending,
+            Self::Position(_) => StrategyStage::InPosition,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -418,6 +453,12 @@ impl StrategyEngine {
         self.series
             .get(key)
             .map_or(StrategyState::Idle, |state| state.phase.public_state())
+    }
+
+    /// Reports the current evidence/lifecycle stage without advancing the series.
+    #[must_use]
+    pub fn stage(&self, key: &CandleKey) -> StrategyStage {
+        self.series.get(key).map_or(StrategyStage::WaitingForSweep, |state| state.phase.stage())
     }
 
     /// Returns an outstanding immutable intent, if execution has not yet
@@ -1732,6 +1773,16 @@ mod tests {
     }
 
     #[test]
+    fn reading_stage_of_an_unknown_series_does_not_create_state() -> TestResult {
+        let engine = StrategyEngine::new(StrategyConfig::default());
+        let key = key_for(instrument()?);
+        assert_eq!(engine.stage(&key), StrategyStage::WaitingForSweep);
+        assert_eq!(engine.state(&key), StrategyState::Idle);
+        assert!(engine.series.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn liquidity_direction_mapping_is_fail_closed_and_explicit() {
         assert_eq!(
             direction_after_sweep(LiquiditySide::BuySide),
@@ -1850,6 +1901,7 @@ mod tests {
             .ok_or_else(|| io::Error::other("expected a generated trade intent"))?;
 
         assert_eq!(engine.state(&key), StrategyState::WaitingForRetracement);
+        assert_eq!(engine.stage(&key), StrategyStage::EntryPending);
         assert_eq!(engine.pending_intent(&key), Some(intent.as_ref()));
 
         let filled_at = at_minute(6)?;
@@ -1867,6 +1919,7 @@ mod tests {
             }]
         );
         assert_eq!(engine.state(&key), StrategyState::InPosition);
+        assert_eq!(engine.stage(&key), StrategyStage::InPosition);
         assert!(engine.pending_intent(&key).is_none());
 
         let fill_replay = engine.process_command(StrategyCommand::EntryFilled {
@@ -1891,6 +1944,8 @@ mod tests {
             }]
         );
         assert_eq!(engine.state(&key), StrategyState::Idle);
+
+        assert_eq!(engine.stage(&key), StrategyStage::WaitingForSweep);
 
         let close_replay = engine.process_command(StrategyCommand::PositionClosed {
             key,
@@ -1949,6 +2004,7 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(pending_state.phase.stage(), StrategyStage::CancellationPending);
         assert_eq!(
             pending_actions,
             vec![StrategyAction::CancelPendingIntent {

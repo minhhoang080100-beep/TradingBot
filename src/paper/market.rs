@@ -137,7 +137,7 @@ impl PublicPaperMarket {
             .query(query)
             .send()
             .await
-            .map_err(|_| PaperMarketError::Transport)?;
+            .map_err(|error| transport_error(&error))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(http_status_error(status, response.headers(), Utc::now()));
@@ -152,7 +152,7 @@ impl PublicPaperMarket {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| PaperMarketError::Transport)?
+            .map_err(|error| transport_error(&error))?
         {
             if chunk.len() > MAX_BODY_BYTES.saturating_sub(body.len()) {
                 return Err(PaperMarketError::ResponseTooLarge);
@@ -167,6 +167,21 @@ impl PublicPaperMarket {
         let mut market = Self::new()?;
         market.origin = origin;
         Ok(market)
+    }
+}
+
+// Classify without retaining reqwest's URL, source chain or free-form message.
+// Timeouts can also be connection/body errors; keep the actionable timeout
+// category first. These remain transport failures, not JSON/schema failures.
+fn transport_error(error: &reqwest::Error) -> PaperMarketError {
+    if error.is_timeout() {
+        PaperMarketError::Timeout
+    } else if error.is_connect() {
+        PaperMarketError::Connection
+    } else if error.is_body() || error.is_decode() {
+        PaperMarketError::ResponseBody
+    } else {
+        PaperMarketError::Transport
     }
 }
 
@@ -541,9 +556,18 @@ pub enum PaperMarketError {
     /// HTTP client construction failed.
     #[error("paper public-market client setup failed")]
     Configuration,
-    /// Network request/body read failed or timed out; there is no automatic retry.
+    /// Unclassified network failure; no URL or underlying error text is retained.
     #[error("paper public-market transport failed")]
     Transport,
+    /// The connection, request or response body exceeded the client timeout.
+    #[error("paper public-market request timed out")]
+    Timeout,
+    /// A connection could not be established, including DNS or TLS failures.
+    #[error("paper public-market connection failed")]
+    Connection,
+    /// Reading/decoding the HTTP body failed before financial JSON validation.
+    #[error("paper public-market response body transfer failed")]
+    ResponseBody,
     /// HTTP response was not successful, including redirects.
     #[error("paper public-market HTTP status {0}")]
     HttpStatus(u16),
@@ -618,6 +642,9 @@ impl PaperMarketError {
     pub const fn is_retryable(&self) -> bool {
         match self {
             Self::Transport
+            | Self::Timeout
+            | Self::Connection
+            | Self::ResponseBody
             | Self::HttpStatus(408 | 429 | 500 | 502 | 503 | 504)
             | Self::HttpRetryAfter { status: 429 | 503, .. }
             | Self::Venue(10000 | 10006 | 10016) => true,
@@ -654,6 +681,26 @@ mod tests {
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    fn diagnostic_client(origin: String, timeout: Duration) -> Result<PublicPaperMarket, reqwest::Error> {
+        Ok(PublicPaperMarket {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .timeout(timeout)
+                .build()?,
+            origin,
+        })
+    }
+
+    fn assert_safe_transport_diagnostic(error: &PaperMarketError) {
+        let diagnostic = format!("{error} {error:?}");
+        for sensitive in ["http", "127.0.0.1", "private-path", "secret-token"] {
+            assert!(!diagnostic.contains(sensitive));
+        }
+        assert!(error.is_retryable());
+    }
 
     fn instrument() -> Result<InstrumentId, Box<dyn Error>> {
         Ok(InstrumentId::new(
@@ -1090,7 +1137,11 @@ mod tests {
 
     #[test]
     fn retry_classification_is_an_explicit_narrow_allowlist() {
-        assert!(PaperMarketError::Transport.is_retryable());
+        for error in [PaperMarketError::Transport, PaperMarketError::Timeout,
+            PaperMarketError::Connection, PaperMarketError::ResponseBody] {
+            assert!(error.is_retryable());
+            assert_eq!(error.suggested_retry_delay(), None);
+        }
         for status in [408, 429, 500, 502, 503, 504] {
             assert!(PaperMarketError::HttpStatus(status).is_retryable());
         }
@@ -1177,6 +1228,68 @@ mod tests {
         assert_eq!(http_status_error(503, &headers, at(0)?), PaperMarketError::InvalidRetryAfter(503));
         // Retry hints never make a forbidden or redirect response retryable.
         assert_eq!(http_status_error(403, &headers, at(0)?), PaperMarketError::HttpStatus(403));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_reports_timeout_without_retaining_url_or_retrying() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/private-path"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+            .expect(1)
+            .mount(&server).await;
+        let market = diagnostic_client(server.uri(), Duration::from_millis(100))?;
+        let error = market.get("/private-path", &[("token", "secret-token".to_owned())])
+            .await.err().ok_or("delayed response did not time out")?;
+        assert_eq!(error, PaperMarketError::Timeout);
+        assert_safe_transport_diagnostic(&error);
+        assert_eq!(server.received_requests().await.ok_or("request capture")?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_reports_connection_failure_without_retaining_url() -> TestResult {
+        // Port zero is not a listening service. This fails on loopback only,
+        // without external DNS/network access or a bind/drop port-reuse race.
+        let market = diagnostic_client("http://127.0.0.1:0".to_owned(), Duration::from_secs(2))?;
+        let error = market.get("/private-path", &[("token", "secret-token".to_owned())])
+            .await.err().ok_or("unexpected loopback connection")?;
+        assert_eq!(error, PaperMarketError::Connection);
+        assert_safe_transport_diagnostic(&error);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_reports_interrupted_body_without_treating_it_as_json() -> TestResult {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let market = diagnostic_client(format!("http://{}", listener.local_addr()?), Duration::from_secs(2))?;
+        let query = [("token", "secret-token".to_owned())];
+        let serve = async {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0_u8; 512];
+                let read = stream.read(&mut chunk).await?;
+                if read == 0 || request.len() + read > 4096 {
+                    return Err(std::io::Error::other("incomplete local test request"));
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            // A valid HTTP header with a prematurely closed body must be a
+            // transport-body failure, rather than a malformed financial record.
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"retCode\":").await?;
+            stream.shutdown().await
+        };
+        let (response, served) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(market.get("/private-path", &query), serve)
+        }).await?;
+        served?;
+        let error = response.err().ok_or("interrupted body accepted")?;
+        assert_eq!(error, PaperMarketError::ResponseBody);
+        assert_safe_transport_diagnostic(&error);
         Ok(())
     }
 

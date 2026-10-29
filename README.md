@@ -28,18 +28,22 @@ Lỗi nội bộ làm engine mất khả năng xử lý an toàn được ghi te
 
 ### Khôi phục lỗi public-data trong cùng phiên
 
+Portfolio chỉ gọi REST khi nến kế tiếp có thể đủ điều kiện xử lý (đóng M1 + 10 giây), thay vì tải lại cùng dữ liệu mỗi 5 giây. `--poll-seconds` vẫn là nhịp kiểm tra; khi sàn công bố chậm, bot tiếp tục thử ở nhịp này và vẫn chịu deadline stale 120 giây. Khi feed bình thường và đã warmup, dự kiến một vòng BTC+ETH mỗi phút (2 GET), thay vì khoảng 24 GET/phút. Đây là giảm request trùng, không thay đổi timeframe hoặc đảm bảo hết rate limit.
+
 Hai runner `live` và `portfolio` thử lại **chỉ các GET dữ liệu công khai**, tối đa 4 lượt thử cho mỗi thao tác trong tổng 60 giây; mỗi lượt portfolio gồm hai GET đồng thời cho BTC+ETH. Chờ nền 1/2/4 giây kèm jitter dương. HTTP 408/429/500/502/503/504, lỗi transport, Bybit `10000`/`10006`/`10016`, JSON không đọc được do syntax/EOF thuộc nhóm có thể thử lại. HTTP 403, lỗi tham số/quyền, cấu trúc success sai, sai instrument/Decimal, clock skew, nến trùng/gap/revision không được bỏ qua hoặc retry vô hạn. Đây là chính sách bảo thủ của bot, không phải bảo đảm rằng mọi lỗi trong nhóm đều tự hết. [Mã lỗi Bybit](https://bybit-exchange.github.io/docs/v5/error)
 
 - Parser kiểm tra `retCode` **trước** schema success: lỗi venue với `result: {}`, `null` hoặc thiếu `result` không còn bị che thành lỗi JSON chung. Log lỗi decode chỉ chứa status, phase/category, dòng/cột và số byte; không ghi body, `retMsg`, token hay URL chứa bí mật.
 - Tôn trọng `Retry-After` hợp lệ trên HTTP 429/503. Nếu thời gian chờ không nằm trong ngân sách phục hồi, bot dừng thay vì gửi sớm hơn yêu cầu của server. Header sai/không rõ cũng dừng; không đổi region, proxy hay endpoint để né giới hạn. [Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after)
 - Mỗi lần thử lấy timestamp request mới. Portfolio thử lại **cả vòng BTC+ETH**, không ghép kết quả BTC cũ với ETH của lần gọi sau. Trong lúc chờ, không gọi engine, không tạo entry/fill và không đặt lại cash, position hay daily-risk baseline.
 - Ngưỡng feed 120 giây tính từ nến cuối **đã xử lý**, có hiệu lực cả khi đang chờ request/backoff/heartbeat. Giữ deadline monotonic đến khi cursor tiến lên, đồng thời kiểm tra UTC; poll/heartbeat hoặc chỉnh lùi đồng hồ không gia hạn deadline của cùng một nến. Trước khi tiếp tục, toàn bộ cửa sổ hồi phục phải đủ, mới và liên tục. TP/SL paper không chạy theo tick trong thời gian mất dữ liệu; khi hồi phục hợp lệ, engine chỉ mô phỏng lại theo các nến nhận được.
-- Nếu Telegram đang bật, portfolio gửi một thông báo mất dữ liệu khi bắt đầu retry; chỉ báo phục hồi sau khi batch đồng bộ mới đã được kiểm tra và ghi journal. HTTP thành công đơn thuần chưa đủ để báo phục hồi. Các tin này dùng cùng session ID và cùng cơ chế best-effort của notifier.
+- Nếu Telegram đang bật, portfolio gửi `PUBLIC DATA RETRY (temporary)` khi bắt đầu retry, kèm mã/loại lỗi đã làm sạch, lượt thử tiếp theo và thời gian chờ. Lỗi transport phân biệt timeout, connection và interrupted body; không xuất URL/error thô. Chỉ báo phục hồi sau khi batch đồng bộ mới (hoặc toàn bộ warmup lúc startup) đã được kiểm tra và ghi journal. Tin phục hồi có số lần retry và thời gian đến batch hợp lệ; HTTP thành công đơn thuần chưa đủ. Các tin dùng cùng session ID và cùng cơ chế best-effort của notifier.
 - SIGTERM/Ctrl+C hủy được request/backoff cả trong startup. Thời hạn `--seconds` tính từ sau warmup và hủy được request/backoff của vòng chạy live. Hết số lần thử/ngân sách hoặc quá stale: bot ghi summary nếu còn ghi đĩa được, hủy pending và giữ vị thế mở dưới dạng marked như trước, sau đó báo lỗi. **Không tự restart hoặc khôi phục tài khoản sau process restart.**
 
 ### Telegram: theo dõi pending, Entry, TP, SL và PnL
 
 Telegram chỉ là kênh thông báo, không điều khiển giao dịch. Tính năng mặc định **tắt**, chỉ bật trong `paper portfolio`. Tin có nhãn `[PAPER]` (startup `[PAPER V3]`), symbol, LONG/SHORT, Entry, TP, SL, quantity, x10, margin ước tính, trade/session ID và balance/equity sau batch. Heartbeat liệt kê **từng lệnh pending/open**, số chỗ BTC/ETH, tổng risk/capital giữ chỗ và cash còn khả dụng; không gộp hai entry cùng symbol thành một giá vào lệnh. Có tin khi đặt limit **chưa khớp**, khớp giả lập, hủy, đóng TP/SL, chặn entry, khởi động/dừng và heartbeat mặc định mỗi 30 phút (`--heartbeat-seconds`, tối thiểu 60). Quan sát theo nến đóng, không phải cập nhật giá tick hay realtime fill từ sàn.
+
+Heartbeat tách riêng `Risk/session halt`, trạng thái feed, tổng retry/recovery của phiên và entry window tại nến cuối đã xử lý. `Risk/session halt: false` không đồng nghĩa đang trong giờ vào lệnh. Khung giờ theo `America/New_York`, thứ Hai–thứ Sáu, có DST; kèm thời điểm nến theo Việt Nam. Với cấu hình mặc định, ngày 29/10/2026 các cửa sổ tương ứng 13:00–16:00 và 18:00–21:00 Việt Nam. Lệnh paper đang tồn tại vẫn được mô phỏng ngoài giờ tạo entry. Discovery BTC/ETH có chẩn đoán riêng đang chờ sweep/MSS/FVG/retracement và lý do setup bị loại gần nhất (ghi rõ thời điểm, là lịch sử chứ không khẳng định lý do chờ hiện tại). Chẩn đoán chỉ đọc, không thêm trường vào journal V3 hoặc thay đổi kết quả replay.
 
 Thiết lập lần đầu bằng **bot mới dành riêng cho paper**:
 
@@ -69,6 +73,13 @@ Docker CMD mới mặc định chạy portfolio BTC/ETH x10, nhưng **Custom Sta
 Giữ volume `/data`, một instance và chính sách restart được mô tả bên dưới. Đặt `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15` để có thời gian xử lý SIGTERM, ghi summary và drain Telegram (tối đa khoảng 5 giây); overlap nên để 0 và chủ động dừng phiên cũ trước khi đổi bản. Railway mặc định có thể force-stop ngay nếu không cấu hình draining; tin dừng cuối không được bảo đảm khi SIGKILL/crash. [Deployment teardown](https://docs.railway.com/deployments/deployment-teardown)
 
 Sao lưu log phiên cũ; rollout tạo phiên 100 USDT mới, không tự chuyển số dư/vị thế đang có. Code mới và Variables chỉ có hiệu lực trên deployment tương ứng; việc viết code cục bộ không thay đổi service đang chạy.
+
+### Kiểm chứng giảm polling và chẩn đoán vận hành (29/10/2026)
+
+- Log Railway phiên `d6dca55` ghi nhận nhiều Bybit `10006` (rate limit) và hai lỗi transport trước 07:42 Việt Nam, đều có retry thành công; service vẫn Online, vốn 100 USDT, chưa có vị thế. Log cũ không phân biệt được nguyên nhân transport cụ thể; không suy đoán do IP dùng chung hay lỗi chiến lược.
+- Native Windows/MSVC Rust 1.89: **465 test all-features** (406 library + 59 CLI), **359 test no-default-features** (300 + 59), Clippy all-targets `-D warnings` ở cả hai cấu hình và release `paper --no-default-features` đều đạt. Kiểm thử bao phủ bỏ request nến trùng, dữ liệu công bố chậm, DST/giờ Việt Nam, phân biệt risk/feed/entry gate, transport timeout/connect/body, diagnostics không thay đổi quyết định và heartbeat bốn lệnh dưới giới hạn Telegram.
+- Replay v1/v2/v3 cũ đạt: v1 giữ quy ước header `mode=replay` và khớp bản replay baseline trước đó; v2/v3 khớp SHA-256 với log nguồn. Smoke release 75 giây với public BTC+ETH, 500 batch warmup + một batch mới, kết thúc có kiểm soát, equity 100 USDT, 0 trade; log mới replay khớp SHA-256. Telegram tắt trong smoke để không gửi tin thử. Bằng chứng cục bộ: `paper-runs/verification-20261029-reliability-report.json` (Git bỏ qua).
+- Các kiểm tra này xác nhận hành vi kỹ thuật, không chứng minh hiệu quả chiến lược hoặc hết mọi lỗi mạng. Chưa chạy lại rustfmt bị Windows Security chặn ở môi trường trước; không thay đổi bảo vệ hệ thống. Build/runtime Railway cần được xác nhận riêng sau push.
 
 ### Kiểm chứng bản vá public-data
 

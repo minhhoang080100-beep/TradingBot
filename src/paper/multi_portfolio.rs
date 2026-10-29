@@ -18,7 +18,7 @@ use crate::{
     models::{Candle, Direction, Exchange, LiquiditySide, MarketKind, SwingKind, SwingPoint,
         Timeframe, TradeIntent, VolumeUnit},
     risk::{LiquidityTarget, ReservationEvent, RiskConfig, RiskError, RiskManager, TradeAssessment},
-    strategy::{StrategyAction, StrategyCommand, StrategyConfig, StrategyEngine},
+    strategy::{SetupDiscardReason, StrategyAction, StrategyCommand, StrategyConfig, StrategyEngine, StrategyStage},
 };
 
 use super::{
@@ -38,6 +38,33 @@ pub struct MultiPortfolioSnapshot {
     pub account: BookSnapshot,
     /// Entries are blocked by drawdown, insolvency, failure or shutdown.
     pub halted: bool,
+}
+
+/// The most recent pre-intent setup discard, retained as historical context.
+///
+/// This observation does not imply that its reason still prevents an entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetupDiscardDiagnostic {
+    /// Candle close at which the discovery strategy discarded the setup.
+    pub at: DateTime<Utc>,
+    /// The exact strategy reason, never inferred from the absence of an order.
+    pub reason: SetupDiscardReason,
+}
+
+/// Bounded, read-only discovery diagnostics outside the deterministic journal.
+///
+/// Existing positions belong to separate owner strategies and remain described
+/// by the account snapshot. This structure describes the next setup search.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiSymbolDiagnostics {
+    /// Exact configured venue symbol.
+    pub symbol: String,
+    /// Most recent candle close analyzed for this symbol, including warm-up.
+    pub last_close: Option<DateTime<Utc>>,
+    /// Current discovery stage; it does not promise an executable entry.
+    pub discovery_stage: StrategyStage,
+    /// Latest historical discard, absent until a setup has been discarded.
+    pub last_discard: Option<SetupDiscardDiagnostic>,
 }
 
 /// Recoverable V3 rejection reasons; slot, hedge and risk limits are distinct.
@@ -143,6 +170,8 @@ struct SymbolState {
     discovery: StrategyEngine,
     liquidity: VecDeque<SwingPoint>,
     liquidity_capacity: usize,
+    last_analyzed_close: Option<DateTime<Utc>>,
+    last_discard: Option<SetupDiscardDiagnostic>,
 }
 
 impl SymbolState {
@@ -152,7 +181,8 @@ impl SymbolState {
         Self { key: CandleKey { instrument: instrument.spec.instrument().clone(), timeframe },
             instrument, ict: IctEngine::new(config),
             discovery: StrategyEngine::new(StrategyConfig::default()),
-            liquidity: VecDeque::new(), liquidity_capacity }
+            liquidity: VecDeque::new(), liquidity_capacity,
+            last_analyzed_close: None, last_discard: None }
     }
 
     fn analyze(&mut self, candle: &Candle) -> Result<IctDetectionBatch, PortfolioError> {
@@ -173,6 +203,7 @@ impl SymbolState {
             self.liquidity.push_back(swing.clone());
             while self.liquidity.len() > self.liquidity_capacity { self.liquidity.pop_front(); }
         }
+        self.last_analyzed_close = Some(candle.close_time());
         Ok(batch)
     }
 
@@ -284,6 +315,20 @@ impl MultiPortfolio {
     pub fn snapshot(&self) -> MultiPortfolioSnapshot {
         MultiPortfolioSnapshot { account: self.book.snapshot(),
             halted: self.entry_halted() || matches!(self.phase, Phase::Stopped | Phase::Poisoned) }
+    }
+
+    /// Reports the next-setup search for each symbol in stable symbol order.
+    ///
+    /// Retains only one discard per symbol. Reading diagnostics neither changes
+    /// strategy/account state nor adds fields to versioned replay records.
+    #[must_use]
+    pub fn diagnostics(&self) -> Vec<MultiSymbolDiagnostics> {
+        self.symbols.iter().map(|(symbol, state)| MultiSymbolDiagnostics {
+            symbol: symbol.clone(),
+            last_close: state.last_analyzed_close,
+            discovery_stage: state.discovery.stage(&state.key),
+            last_discard: state.last_discard,
+        }).collect()
     }
 
     /// Whether a fatal transition requires diagnostic-only session recording.
@@ -464,7 +509,10 @@ impl MultiPortfolio {
                     }
                 }
                 StrategyAction::InputRejected { .. } => analysis.reject(MultiRejection::StrategyInput),
-                StrategyAction::SetupDiscarded { .. } | StrategyAction::DataDegraded { .. } => {}
+                StrategyAction::SetupDiscarded { at, reason, .. } => {
+                    self.state_mut(symbol)?.last_discard = Some(SetupDiscardDiagnostic { at, reason });
+                }
+                StrategyAction::DataDegraded { .. } => {}
                 _ => return Err(PortfolioError::Invariant("discovery emitted an owned lifecycle").into()),
             }
         }
@@ -709,6 +757,70 @@ mod tests {
         }
         assert_eq!(engine.snapshot().account.orders.len(), 2);
         Ok(engine)
+    }
+
+    #[test]
+    fn diagnostics_follow_discovery_without_changing_serialized_steps() -> TestResult {
+        let mut observed = portfolio()?;
+        let mut control = portfolio()?;
+        assert!(observed.diagnostics().iter().all(|row| row.last_close.is_none()
+            && row.last_discard.is_none() && row.discovery_stage == StrategyStage::WaitingForSweep));
+        let mut stages = Vec::new();
+        for (minute, prices) in setup(150).into_iter().enumerate() {
+            let minute = i64::try_from(minute)?;
+            let candles = batch(minute, prices, NEUTRAL)?;
+            let before = observed.snapshot();
+            assert_eq!(observed.diagnostics(), observed.diagnostics());
+            assert_eq!(observed.snapshot(), before);
+            let (actual, expected) = if minute < 9 {
+                (observed.warm_up(&candles)?, control.warm_up(&candles)?)
+            } else {
+                (observed.process_batch(&candles)?, control.process_batch(&candles)?)
+            };
+            let actual_json = serde_json::to_value(&actual)?;
+            assert_eq!(actual_json, serde_json::to_value(&expected)?);
+            // Observer data must not silently change the v3 replay schema.
+            let step_keys: Vec<_> = actual_json.as_object().ok_or("missing step")?.keys().map(String::as_str).collect();
+            assert_eq!(step_keys, ["analysis", "events", "snapshot"]);
+            let analysis_keys: Vec<_> = actual_json["analysis"][0].as_object().ok_or("missing analysis")?
+                .keys().map(String::as_str).collect();
+            assert_eq!(analysis_keys, ["intents", "rejected", "rejection_reasons", "signals", "symbol"]);
+            let diagnostics = observed.diagnostics();
+            assert_eq!(diagnostics.iter().map(|row| row.symbol.as_str()).collect::<Vec<_>>(), ["BTCUSDT", "ETHUSDT"]);
+            let expected_close = at(minute + 1)?;
+            assert!(diagnostics.iter().all(|row| row.last_close == Some(expected_close)));
+            stages.push(diagnostics[0].discovery_stage);
+        }
+        for expected in [StrategyStage::WaitingForSweep, StrategyStage::WaitingForMss,
+            StrategyStage::WaitingForFvg, StrategyStage::WaitingForRetracement] {
+            assert!(stages.contains(&expected), "missing {expected:?}: {stages:?}");
+        }
+        assert_eq!(observed.snapshot(), control.snapshot());
+        assert_eq!(observed.snapshot().account.orders.len(), 1);
+        // An existing order's owner is independent of the fresh discovery phase.
+        assert_eq!(observed.diagnostics()[0].discovery_stage, StrategyStage::WaitingForSweep);
+        Ok(())
+    }
+
+    #[test]
+    fn diagnostics_report_actual_outside_window_discard_as_historical_context() -> TestResult {
+        let mut engine = portfolio()?;
+        for (minute, prices) in setup(150).into_iter().enumerate() {
+            // 05:00 UTC is 01:00 New York on the fixture date, outside both windows.
+            engine.process_batch(&batch(i64::try_from(minute)? - 360, prices, NEUTRAL)?)?;
+        }
+        let diagnostics = engine.diagnostics();
+        assert_eq!(diagnostics[0].last_close, Some(at(-335)?));
+        assert_eq!(diagnostics[0].discovery_stage, StrategyStage::WaitingForSweep);
+        let discard = SetupDiscardDiagnostic { at: at(-335)?, reason: SetupDiscardReason::EntryTouchedOutsideKillzone };
+        assert_eq!(diagnostics[0].last_discard, Some(discard));
+        assert!(diagnostics[1].last_discard.is_none());
+        assert!(engine.snapshot().account.orders.is_empty());
+        assert!(!engine.snapshot().halted);
+        engine.process_batch(&batch(-335, NEUTRAL, NEUTRAL)?)?;
+        assert_eq!(engine.diagnostics()[0].last_close, Some(at(-334)?));
+        assert_eq!(engine.diagnostics()[0].last_discard, Some(discard));
+        Ok(())
     }
 
     #[test]

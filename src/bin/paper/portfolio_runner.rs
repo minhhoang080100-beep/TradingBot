@@ -5,6 +5,7 @@ use std::{collections::{BTreeMap, VecDeque}, future::Future, time::Duration};
 use chrono::{DateTime, Utc};
 use futures_util::future::try_join_all;
 use ict_trading_bot::{
+    ict_engine::{Killzone, KillzoneFilter},
     paper::{BookOrderState, PaperConfig, PaperEvent, PaperInstrument, PaperMarketError, PaperOrderSnapshot, MultiPortfolio as PaperPortfolio, PortfolioEvent, MultiPortfolioSnapshot as PortfolioSnapshot, PublicPaperMarket},
     telegram::{TelegramConfig, TelegramNotifier},
     Candle, Direction, Timeframe,
@@ -95,6 +96,8 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
         tokio::task::block_in_place(|| log.append(&batch, true, &step))?;
         retain(&mut recent, batch);
     }
+    // Startup retries are resolved only after the complete warmup is journaled.
+    recovery_state.committed(notifier, session, cursor);
     println!("PAPER PORTFOLIO V3 | max_active=4 | max_per_symbol=2 | total_risk_cap=3% | symbols={} | initial={} USDT | leverage={}x | warmup={} each | candle_delay=10s | session={} | log={}",
         options.symbols.join(","), options.config.initial_balance(), options.config.leverage(), options.warmup, session, options.output.display());
     println!("{}", serde_json::to_string(&engine.snapshot())?);
@@ -155,11 +158,16 @@ async fn collect(
             () = tokio::time::sleep_until(stale_at) => return Err("synchronized portfolio feed is stale; recovery stopped".into()),
             _ = heartbeat.tick() => {
                 ensure_joint_feed_current(*cursor, stale_at)?;
-                notify(notifier, status_message(session, "HEARTBEAT", Some(*cursor), &engine.snapshot()));
+                let message = format!("{}\n{}", heartbeat_message(session, *cursor, &engine.snapshot(), recovery_state), diagnostics_message(engine));
+                notify(notifier, message);
                 continue;
             }
             _ = poll.tick() => {}
         }
+        // Closed M1 bars cannot add a usable batch until the next close plus
+        // settlement delay. Avoid repeatedly downloading the same ten bars.
+        // Poll/heartbeat/shutdown and the absolute freshness guard stay active.
+        if !next_batch_due(*cursor, Utc::now()) { continue; }
         let (rows, requested_at) = tokio::select! {
             biased;
             result = &mut *shutdown => { result?; return Ok("shutdown_signal"); }
@@ -181,6 +189,7 @@ async fn collect(
             // Journal evidence precedes best-effort external notification.
             tokio::task::block_in_place(|| log.append(&batch, false, &step))?;
             println!("{}", serde_json::to_string(&step)?);
+            println!("Paper setup diagnostics: {}", diagnostics_message(engine).replace('\n', " | "));
             publish_events(notifier, session, &step.events, &step.snapshot, options.config);
             *cursor = at;
             stale_at = feed_deadline(*cursor)?;
@@ -191,6 +200,11 @@ async fn collect(
         // discontinuous candle must fail before this post-commit notification.
         if advanced { recovery_state.committed(notifier, session, *cursor); }
     }
+}
+
+fn next_batch_due(cursor: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(cursor)
+        >= Timeframe::M1.duration() + chrono::Duration::seconds(SETTLEMENT_DELAY_SECONDS)
 }
 
 fn ensure_joint_feed_current(cursor: DateTime<Utc>, stale_at: tokio::time::Instant) -> Result<(), BoxError> {
@@ -253,14 +267,23 @@ fn validate_round(rows: &[Vec<Candle>], count: usize, recent: &VecDeque<Vec<Cand
 #[derive(Debug, Default)]
 struct FeedRecovery {
     outage_announced: bool,
+    started: Option<tokio::time::Instant>,
+    episode_retries: u32,
+    total_retries: u64,
+    recoveries: u64,
 }
 
 impl FeedRecovery {
     fn observe(&mut self, notice: &RecoveryNotice, notifier: Option<&TelegramNotifier>, session: Uuid) {
         recovery::log_notice(notice);
-        if matches!(notice, RecoveryNotice::Retrying { .. }) && !self.outage_announced {
-            self.outage_announced = true;
-            notify(notifier, format!("[PAPER] PUBLIC DATA OUTAGE\nSession: {session}\nRetrying public data; new entry processing is paused. No account reset occurs; existing paper state (if any) and session are retained.\nOHLC protective fills are NOT realtime during the outage; no exchange orders or live protection exist.\nRecovery is bounded; stale or invalid data stops the session."));
+        if let RecoveryNotice::Retrying { operation, next_attempt, max_attempts, delay, error, .. } = notice {
+            self.episode_retries = self.episode_retries.saturating_add(1);
+            self.total_retries = self.total_retries.saturating_add(1);
+            if !self.outage_announced {
+                self.outage_announced = true;
+                self.started = Some(tokio::time::Instant::now());
+                notify(notifier, format!("[PAPER] PUBLIC DATA RETRY (temporary)\nSession: {session}\nOperation: {operation}\nReason: {error}\nNext attempt: {next_attempt}/{max_attempts}; wait {} ms\nNew entry processing is paused until synchronized data is validated and journaled. Same account retained.\nPaper TP/SL uses closed-candle OHLC; no realtime exchange protection. Stale or invalid data stops the session.", delay.as_millis()));
+            }
         }
         // Recovered here means only that HTTP parsing completed. Announce
         // resumed data processing only after a complete validated batch commits.
@@ -269,7 +292,10 @@ impl FeedRecovery {
     fn committed(&mut self, notifier: Option<&TelegramNotifier>, session: Uuid, cursor: DateTime<Utc>) {
         if self.outage_announced {
             self.outage_announced = false;
-            notify(notifier, format!("[PAPER] PUBLIC DATA RECOVERED\nSession: {session}\nComplete synchronized data was validated and journaled. Same account retained; data processing resumed subject to all risk limits.\nLast processed close: {cursor}\nAny catch-up fills are closed-candle OHLC simulation, not realtime protective execution."));
+            let elapsed = self.started.take().map_or(0, |at| at.elapsed().as_secs());
+            self.recoveries = self.recoveries.saturating_add(1);
+            notify(notifier, format!("[PAPER] PUBLIC DATA RECOVERED\nSession: {session}\nRetries: {}; elapsed to validated batch: {elapsed}s\nComplete synchronized data was validated and journaled. Same account retained; data processing resumed subject to entry windows and risk limits.\nLast processed close: {cursor}\nAny catch-up fills are closed-candle OHLC simulation, not realtime protective execution.", self.episode_retries));
+            self.episode_retries = 0;
         }
     }
 }
@@ -347,10 +373,47 @@ fn status_message(session: Uuid, reason: &str, last_close: Option<DateTime<Utc>>
     };
     let btc = snapshot.account.orders.iter().filter(|order| order.symbol == "BTCUSDT").count();
     let eth = snapshot.account.orders.iter().filter(|order| order.symbol == "ETHUSDT").count();
-    format!("[PAPER] {reason}\nSession: {session}\nBalance: {} USDT\nEquity: {} USDT\nRealized PnL: {} USDT\nUnrealized PnL: {} USDT\nFees paid: {} USDT\nCompleted trades: {}\nEntries blocked: {}\nLast processed close: {}\nLeverage: {}x\nActive (pending + open): {}/4; BTC {btc}/2; ETH {eth}/2\nReserved risk: {} USDT (3% cap at admission)\nReserved capital: {} USDT; available cash: {} USDT\n{detail}",
+    format!("[PAPER] {reason}\nSession: {session}\nBalance: {} USDT\nEquity: {} USDT\nRealized PnL: {} USDT\nUnrealized PnL: {} USDT\nFees paid: {} USDT\nCompleted trades: {}\nRisk/session halt: {}\nLast processed close: {}\nLeverage: {}x\nActive (pending + open): {}/4; BTC {btc}/2; ETH {eth}/2\nReserved risk: {} USDT (3% cap at admission)\nReserved capital: {} USDT; available cash: {} USDT\n{detail}",
         snapshot.account.balance, snapshot.account.equity, snapshot.account.realized_pnl, snapshot.account.unrealized_pnl, snapshot.account.fees_paid,
         snapshot.account.completed_trades, snapshot.halted, last_close.map_or_else(|| "none".to_owned(), |at| at.to_string()),
         snapshot.account.leverage, snapshot.account.orders.len(), snapshot.account.reserved_risk, snapshot.account.reserved_capital, snapshot.account.available_cash)
+}
+
+fn heartbeat_message(session: Uuid, cursor: DateTime<Utc>, snapshot: &PortfolioSnapshot,
+    recovery: &FeedRecovery) -> String {
+    let window = KillzoneFilter::default().classify(cursor);
+    let window_name = match window {
+        Some(Killzone::London) => "OPEN (London)",
+        Some(Killzone::NewYork) => "OPEN (New York)",
+        None => "CLOSED (outside configured entry hours)",
+    };
+    let feed = if recovery.outage_announced { "RETRYING / awaiting validated batch" }
+        else { "CURRENT (last processed batch validated)" };
+    let gate = if snapshot.halted { "PAUSED: risk/session halt" }
+        else if recovery.outage_announced { "PAUSED: public data recovery" }
+        else if window.is_none() { "PAUSED: outside entry window" }
+        else { "OPEN: still requires a valid setup, free slots and risk/margin approval" };
+    format!("{}\n\nFeed: {feed}\nFeed retries/recoveries this session: {}/{}\nEntry window at last candle: {window_name}\nNew entry timing/data gate: {gate}\nLast candle (Vietnam): {}\nSchedule: weekdays 02:00-05:00 / 07:00-10:00 America/New_York (DST-aware). Existing paper orders continue to be simulated outside entry windows.",
+        status_message(session, "HEARTBEAT", Some(cursor), snapshot), recovery.total_retries,
+        recovery.recoveries, cursor.with_timezone(&chrono_tz::Asia::Ho_Chi_Minh).format("%Y-%m-%d %H:%M:%S %Z"))
+}
+
+fn diagnostics_message(engine: &PaperPortfolio) -> String {
+    use ict_trading_bot::strategy::StrategyStage;
+    engine.diagnostics().iter().map(|item| {
+        let stage = match item.discovery_stage {
+            StrategyStage::WaitingForSweep => "waiting for liquidity sweep",
+            StrategyStage::WaitingForMss => "sweep seen; waiting for displacement + MSS",
+            StrategyStage::WaitingForFvg => "MSS seen; waiting for FVG confirmation",
+            StrategyStage::WaitingForRetracement => "FVG armed; waiting for retracement",
+            StrategyStage::EntryPending => "limit entry pending",
+            StrategyStage::CancellationPending => "entry cancellation pending",
+            StrategyStage::InPosition => "position open",
+        };
+        let discard = item.last_discard.as_ref().map_or_else(String::new, |last|
+            format!("; last discarded setup: {:?} at {} (historical)", last.reason, last.at));
+        format!("{} discovery: {stage}{discard}", item.symbol)
+    }).collect::<Vec<_>>().join("\n")
 }
 
 #[cfg(test)]
@@ -582,7 +645,10 @@ mod notification_tests {
             active.reserved_capital = Decimal::MAX;
             snapshot.account.orders.push(active);
         }
-        let message = status_message(Uuid::from_u128(7), "HEARTBEAT", Some(at(420)?), &snapshot);
+        let recovery = FeedRecovery { total_retries: u64::MAX, recoveries: u64::MAX, ..FeedRecovery::default() };
+        let mut message = heartbeat_message(Uuid::from_u128(7), at(420)?, &snapshot, &recovery);
+        // Reserve ample space for the bounded two-symbol diagnostics suffix.
+        message.push_str(&"x".repeat(512));
         assert!(message.contains("Active (pending + open): 4/4; BTC 2/2; ETH 2/2"));
         assert_eq!(message.matches("Trade ID:").count(), 4);
         for active in &snapshot.account.orders {
@@ -791,10 +857,77 @@ mod notification_tests {
         state.observe(&retry, None, session);
         state.observe(&RecoveryNotice::Recovered { operation: "portfolio_candles", attempts: 2 }, None, session);
         assert!(state.outage_announced, "HTTP success is not validated data recovery");
+        assert_eq!(state.total_retries, 2);
+        assert_eq!(state.recoveries, 0);
         state.committed(None, session, Utc::now());
         assert!(!state.outage_announced);
+        assert_eq!(state.recoveries, 1);
+        assert_eq!(state.episode_retries, 0);
+        assert!(state.started.is_none());
         state.committed(None, session, Utc::now());
         assert!(!state.outage_announced);
+        assert_eq!(state.recoveries, 1);
+    }
+
+    #[test]
+    fn settled_polling_skips_duplicate_rounds_but_retries_late_bars() -> Result<(), BoxError> {
+        let mut cursor = at(0)?;
+        let mut requests = Vec::new();
+        for second in (10..=190).step_by(5) {
+            if next_batch_due(cursor, at(second)?) {
+                requests.push(second);
+                // Simulate one delayed publication: the 130s request yields
+                // no new batch; only a real cursor advance suppresses polling.
+                if second != 130 { cursor = at(second / 60 * 60)?; }
+            }
+        }
+        assert_eq!(requests, [70, 130, 135, 190]);
+        assert!(!next_batch_due(at(60)?, at(129)?));
+        assert!(next_batch_due(at(60)?, at(130)?));
+        assert!(!next_batch_due(at(60)?, at(59)?));
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_separates_risk_feed_and_entry_window() -> Result<(), BoxError> {
+        let outside = DateTime::parse_from_rfc3339("2026-10-29T00:35:00Z")?.with_timezone(&Utc);
+        let inside = DateTime::parse_from_rfc3339("2026-10-29T06:30:00Z")?.with_timezone(&Utc);
+        let mut snapshot = snapshot();
+        let mut recovery = FeedRecovery::default();
+        let message = heartbeat_message(Uuid::nil(), outside, &snapshot, &recovery);
+        assert!(message.contains("Risk/session halt: false"));
+        assert!(message.contains("Entry window at last candle: CLOSED"));
+        assert!(message.contains("PAUSED: outside entry window"));
+        assert!(message.contains("2026-10-29 07:35:00"));
+        assert!(!message.contains("Entries blocked: false"));
+        recovery.outage_announced = true;
+        let message = heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery);
+        assert!(message.contains("RETRYING / awaiting validated batch"));
+        assert!(message.contains("PAUSED: public data recovery"));
+        recovery.outage_announced = false;
+        snapshot.halted = true;
+        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery).contains("PAUSED: risk/session halt"));
+        snapshot.halted = false;
+        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery).contains("OPEN: still requires a valid setup"));
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_entry_windows_follow_dst_weekdays_and_exclusive_end() -> Result<(), BoxError> {
+        for (timestamp, expected) in [
+            ("2026-10-29T06:00:00Z", "OPEN (London)"),
+            ("2026-10-29T09:00:00Z", "CLOSED"),
+            ("2026-10-29T11:00:00Z", "OPEN (New York)"),
+            ("2026-10-29T14:00:00Z", "CLOSED"),
+            ("2026-11-02T06:30:00Z", "CLOSED"),
+            ("2026-11-02T07:00:00Z", "OPEN (London)"),
+            ("2026-10-31T06:30:00Z", "CLOSED"),
+        ] {
+            let at = DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc);
+            let message = heartbeat_message(Uuid::nil(), at, &snapshot(), &FeedRecovery::default());
+            assert!(message.contains(&format!("Entry window at last candle: {expected}")), "{timestamp}");
+        }
+        Ok(())
     }
 
     #[tokio::test]
