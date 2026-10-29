@@ -24,7 +24,9 @@ cargo run --locked --release --no-default-features --bin paper -- portfolio --sy
 
 Bỏ `--seconds` để chạy liên tục. **Mỗi restart/redeploy vẫn tạo tài khoản mới**; volume chỉ giữ log, chưa resume cash/vị thế/risk. Shutdown hủy pending nhưng không ghi một giao dịch đóng vị thế giả. Không gộp các phiên mới thành một lịch sử lợi nhuận liên tục.
 
-Lỗi nội bộ làm engine mất khả năng xử lý an toàn được ghi terminal record `aborted` khi còn ghi được đĩa: snapshot chỉ là bằng chứng chẩn đoán, replay sẽ từ chối rõ ràng, không coi là phiên hoàn tất. Lỗi ghi đĩa/crash có thể để lại log chưa hoàn chỉnh. Signal dừng được đăng ký trước startup; dừng trong warmup không tạo giao dịch.
+Journal portfolio giới hạn 100.000 batch (gồm warmup), 256 MiB và 64 KiB mỗi record. Runner kiểm tra trước khi xử lý nến, giữ chỗ cho một batch tối đa và terminal record; hết giới hạn thì dừng trước khi engine tiến thêm, hủy pending và lưu summary nếu đĩa còn ghi được. Giới hạn batch tương đương khoảng 69 ngày sau warmup, chưa phải khả năng chạy vô hạn. Chưa có rotation hoặc tự xóa log cũ; dung lượng của nhiều phiên vẫn cộng dồn trên volume.
+
+Nếu engine lỗi hoặc đã xử lý nến nhưng không ghi được kết quả, runner không được ghi `summary` như một phiên có thể replay đầy đủ: chỉ ghi `aborted` khi journal còn ghi an toàn được. Snapshot đó chỉ là bằng chứng chẩn đoán; replay từ chối. Lỗi I/O, ghi dở hoặc crash có thể khiến không ghi được cả terminal record; log thiếu summary cũng bị từ chối. Preflight dung lượng không bảo đảm filesystem còn chỗ hay không gặp lỗi. Signal dừng được đăng ký trước startup; dừng trong warmup không tạo giao dịch.
 
 ### Khôi phục lỗi public-data trong cùng phiên
 
@@ -51,6 +53,8 @@ Mặc định mỗi 30 phút có **một tin cập nhật tổng hợp** (`--hea
 - Từng lệnh **CHỜ KHỚP/ĐANG MỞ** của BTC/ETH: LONG/SHORT, Entry, TP, SL, khối lượng, rủi ro/vốn giữ chỗ; cùng số chỗ còn lại, vốn khả dụng và đòn bẩy x10. Hai lệnh cùng cặp vẫn có giá và mã riêng.
 - Trạng thái dữ liệu, lịch vào lệnh, điều kiện đang chặn lệnh mới và số lần thử lại/phục hồi. `always` xét setup 24/7; `killzones` dùng giờ New York có DST, thứ Hai–thứ Sáu. Vị thế đang có vẫn được mô phỏng ngoài giờ tạo lệnh.
 - BTC/ETH đang chờ sweep, MSS, FVG hay hồi giá; số setup đủ chuỗi, limit được nhận, lượt từ chối và nguyên nhân phổ biến nhất. Số liệu cộng dồn từ đầu phiên, bỏ warmup/nến trùng và bắt đầu lại sau restart. Tín hiệu sweep/MSS/FVG riêng lẻ không đồng nghĩa có setup đủ điều kiện; limit được nhận chưa có nghĩa đã khớp. Thống kê đầy đủ vẫn ở console, không gửi thêm hai tin riêng mỗi kỳ.
+
+Chẩn đoán nhận lệnh phân biệt **RR trước phí**, **RR sau chi phí**, khối lượng tối thiểu, thiếu vốn, giới hạn risk/slot và thiếu mục tiêu TP. Khi risk manager trả số RR trước phí hoặc khối lượng cụ thể, tin hiển thị đúng số đó và ngưỡng so sánh; lỗi RR sau chi phí hiện chỉ có loại lỗi, **không tự suy đoán một số net RR**. Lần từ chối gần nhất có giờ nến theo Việt Nam: đây là lịch sử, không khẳng định điều kiện đó vẫn đang chặn setup hiện tại. Console mỗi nến chỉ thêm chi tiết từ chối phát sinh đúng nến đó. Bộ đếm admission chỉ tính intent bị từ chối cuối cùng; thử TP nghiên cứu thất bại rồi chọn được TP khác không bị ghi thành một lệnh bị loại. Các quan sát này không thay quyết định giao dịch hoặc schema journal V1–V4.
 
 Thông báo vòng đời phân biệt rõ **ĐẶT LIMIT — CHƯA KHỚP**, **ĐÃ KHỚP LỆNH MÔ PHỎNG**, **ĐÃ HỦY LIMIT CHƯA KHỚP**, **ĐÃ CHỐT TP** và **ĐÃ CẮT SL**. Tin đóng lệnh có giá thoát và lãi/lỗ ròng của chính lệnh đó; tin khởi động/dừng hoặc tạm ngừng lệnh mới không được coi là đã đóng vị thế. Toàn bộ cập nhật dựa trên nến đóng, không phải giá tick hay xác nhận khớp lệnh từ sàn.
 
@@ -87,10 +91,11 @@ Sao lưu log phiên cũ; rollout tạo phiên 100 USDT mới, không tự chuy�
 
 Trên Rust 1.89 native Windows/MSVC:
 
-- **518 test all-features**: 421 thư viện + 75 CLI paper + 8 backtest + 14 collector/recovery.
-- **412 test no-default-features**: 315 thư viện + 75 CLI paper + 8 backtest + 14 collector/recovery.
-- Clippy `--all-targets ... -- -D warnings` đạt ở cả hai cấu hình; release `--no-default-features` của ba binary `paper`, `paper_history`, `paper_backtest` build đạt.
-- Smoke release 75 giây với public BTC/ETH, 500 batch warmup + 2 batch mới, `poll=60`/heartbeat 60 giây và Telegram tắt: dừng có kiểm soát. Replay V1/V2/V3/V4 và log smoke mới giữ SHA-256 tương ứng; hai lần chạy báo cáo nghiên cứu cuối cho kết quả giống nhau từng byte. Bằng chứng: `paper-runs/verification-20261029-research-report.json`.
+- **531 test all-features**: 429 thư viện + 79 CLI paper + 9 backtest + 14 collector/recovery.
+- **425 test no-default-features**: 323 thư viện + 79 CLI paper + 9 backtest + 14 collector/recovery.
+- Clippy `--all-targets ... -- -D warnings` đạt ở cả hai cấu hình. Test mới kiểm tra chẩn đoán admission không làm đổi kết quả, trì hoãn entry không làm sai phí/expiry/protective exit và journal không ghi summary giả sau lỗi commit.
+- Release `--no-default-features` của cả ba binary `paper`, `paper_history`, `paper_backtest` build đạt. Báo cáo `evaluation-integrity.json` (version 2) lặp lại giống nhau từng byte; metrics, snapshot cuối, trade events và daily marks của sáu cấu hình cũ giữ nguyên so với báo cáo trước.
+- Smoke release public BTC/ETH 75 giây có 500 batch warmup + một batch live, `poll=60`/heartbeat 60 giây và Telegram tắt: dừng đúng `duration_elapsed`, tài sản 100 USDT. Replay V1/V2/V3/V4 và log smoke mới giữ SHA-256 tương ứng. Bằng chứng: `paper-runs/verification-20261029-integrity-report.json`.
 
 Kiểm thử bao phủ giới hạn vốn/rủi ro/nhiều lệnh, entry 24/7 và killzone, retry/stale/deadline, thống kê setup, Telegram bốn lệnh dưới giới hạn 4.096 ký tự, dataset liên tục, phân tách thời gian và phí/PnL. Đây là kiểm chứng phần mềm cục bộ; không chứng minh lợi nhuận, độ trễ khớp lệnh hay bản triển khai Railway đã được cập nhật. Không gửi Telegram thử trong bộ kiểm tra.
 
@@ -108,24 +113,30 @@ cargo run --locked --release --no-default-features --bin paper_backtest -- --dat
 
 Dataset đã thu thập tại `paper-runs/research-20261029-30d/`: **43.700 nến mỗi cặp**, gồm 500 nến warmup và 30 ngày đánh giá `[29/09/2026 00:00, 29/10/2026 00:00)` UTC. Chia theo thời gian thành 23 ngày phát triển và 7 ngày kiểm tra sau cùng (holdout). Mỗi phần có tài khoản 100 USDT độc lập và chỉ warmup bằng 500 nến trước nó; không cộng dồn lợi nhuận của hai phần.
 
-Bộ đánh giá so sánh sáu cấu hình cố định: `always`/`killzones` theo chiến lược hiện tại ở hai mức chi phí, cùng một giả thuyết chọn TP dành riêng cho nghiên cứu ở hai mức chi phí. Giả thuyết `nearest_viable` xét mục tiêu thanh khoản đối diện đã xác nhận tiếp theo chỉ khi mục tiêu gần nhất không đạt RR trước/sau chi phí; không thử mục tiêu xa hơn để vượt lỗi thiếu vốn, khối lượng hoặc số lệnh. Vẫn giữ setup, x10, risk 1%/3%, giới hạn 4/2 lệnh và net RR ≥ 2. **Giả thuyết này chưa được chọn làm chiến lược chạy thực tế của PAPER.**
+Báo cáo mới dùng `report_version=2` với **10 cấu hình cố định**: sáu cấu hình cũ (`always`/`killzones` hiện tại và TP nghiên cứu `nearest_viable`, mỗi loại ở hai mức chi phí), thêm bốn cấu hình `always` hiện tại/`nearest_viable` ở hai mức chi phí nhưng không cho entry khớp trong nến hợp lệ đầu tiên. Quy tắc trì hoãn đúng một nến này chỉ là phép thử độ nhạy: không thay expiry hoặc protective exit, không tái tạo độ trễ thời gian thực hay giá trong thời gian xử lý bù dữ liệu, và không bảo đảm tạo ra cận dưới của PnL.
 
-Kết quả trong `paper-runs/research-20261029-30d/evaluation-final.json` dưới đây là thay đổi **tổng tài sản sau phí, đơn vị USDT**, không phải lợi nhuận tiền thật:
+Giả thuyết `nearest_viable` xét mục tiêu thanh khoản đối diện đã xác nhận tiếp theo chỉ khi mục tiêu gần nhất không đạt RR trước/sau chi phí; không thử mục tiêu xa hơn để vượt lỗi thiếu vốn, khối lượng hoặc số lệnh. Vẫn giữ setup, x10, risk 1%/3%, giới hạn 4/2 lệnh và net RR ≥ 2. **TP nghiên cứu và trì hoãn một nến chưa được áp dụng vào runner đang chạy; V1–V4 vẫn replay theo quy tắc cũ.**
+
+Kết quả ngày 29/10/2026 trong `paper-runs/research-20261029-30d/evaluation-integrity.json` dưới đây là thay đổi **tổng tài sản sau phí, đơn vị USDT**, không phải lợi nhuận tiền thật:
 
 | Cấu hình 24/7 | Phát triển: số lệnh đóng / thay đổi tài sản | Holdout: số lệnh đóng / thay đổi tài sản |
 | --- | ---: | ---: |
 | Hiện tại, phí 6 bps mỗi chiều + stop slippage 2 bps | 1 lệnh lỗ / −0.95922440 | 0 / 0 |
 | Nghiên cứu `nearest_viable`, chi phí 6/2 bps | 50 / −17.69644042 | 10 / +6.6100374 |
 | Nghiên cứu `nearest_viable`, chi phí tăng lên 10/5 bps | 47 / −25.3356977 | 9 / +0.6855311 |
+| `nearest_viable`, bỏ nến entry đầu, chi phí 6/2 bps | 35 / −17.84982808 | 9 / +7.5676482 |
+| `nearest_viable`, bỏ nến entry đầu, chi phí 10/5 bps | 33 / −20.3817326 | 8 / +1.5262145 |
 
-Holdout `nearest_viable` ở mức phí 6/2 còn **một vị thế mở**: +6.6100374 bao gồm định giá vị thế này theo nến cuối, không phải toàn bộ lãi đã chốt. Các cấu hình killzone và cấu hình hiện tại với chi phí tăng không có giao dịch trong mẫu này. Giao dịch nhiều hơn đi kèm thua lỗ đáng kể ở tập phát triển; holdout dương với 9–10 giao dịch chưa chứng minh lợi thế bền vững. Mọi báo cáo giữ trạng thái **`UNVALIDATED`**, không tự điều chỉnh hoặc đưa chiến lược nghiên cứu lên Railway.
+Hai holdout `nearest_viable` mức phí 6/2 đều còn **một vị thế mở**: +6.6100374 và +7.5676482 bao gồm định giá vị thế theo nến cuối, không phải toàn bộ lãi đã chốt. Cấu hình hiện tại khi trì hoãn entry vẫn có một lệnh lỗ ở tập phát triển và không có lệnh ở holdout; các cấu hình killzone và cấu hình hiện tại với chi phí tăng không có giao dịch trong mẫu này.
+
+Chẩn đoán chính xác cho cấu hình hiện tại trong 30 ngày: **77 intent, 62 bị loại vì RR trước phí, 14 vì RR sau chi phí, chỉ một được nhận**. Vì vậy không quy chung mọi lần từ chối cho phí hoặc kết nối. Phương án TP xa hơn và trì hoãn entry vẫn thua lỗ đáng kể ở 23 ngày đầu; 7 ngày cuối chỉ có 8–10 lệnh đóng, kết quả nhạy với chi phí và còn exposure ở một số cấu hình. **Chưa chọn phương án nghiên cứu nào để triển khai.** Mọi báo cáo giữ trạng thái **`UNVALIDATED`**, không tự điều chỉnh hoặc thay chiến lược chạy trên Railway.
 
 Báo cáo lưu hash dataset, cấu hình và mã nguồn được biên dịch để đối chiếu. Các giới hạn khi đọc kết quả:
 
 - Tick/step/minimum dùng metadata tại lúc thu thập, có thể khác metadata lịch sử. Phí/slippage là giả định kiểm tra, chưa xác minh theo fee tier tài khoản.
 - Chưa mô phỏng funding, thanh lý, mark-price maintenance margin, hàng đợi lệnh, khớp một phần hoặc tác động thị trường. Drawdown chỉ đo ở giá đóng nến.
 - Chưa mô phỏng độ trễ chờ REST ổn định, polling và nhận lệnh: OHLC nến kế tiếp có thể chứa giá xuất hiện trước lúc bot thực sự nhận setup. PAPER/backtest không chứng minh khả năng khớp lệnh thực tại những giá đó.
-- So sánh nhiều cấu hình trên cùng holdout không tạo ra kiểm chứng độc lập cho cấu hình được chọn. Cần thêm dữ liệu chưa dùng, đánh giá qua nhiều trạng thái thị trường và forward paper trước khi thay chiến lược đang chạy.
+- So sánh nhiều cấu hình trên cùng holdout không tạo ra kiểm chứng độc lập cho cấu hình được chọn. Bảy ngày cuối đã được dùng ở lần đánh giá trước; phép thử mới không biến chúng thành dữ liệu kiểm tra chưa dùng. Cần thêm dữ liệu mới, đánh giá qua nhiều trạng thái thị trường và forward paper trước khi thay chiến lược đang chạy.
 
 ## Chế độ cũ: PAPER đơn cặp, 1x, không cần API key
 

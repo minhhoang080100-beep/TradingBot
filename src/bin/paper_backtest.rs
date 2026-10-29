@@ -25,7 +25,9 @@ The first 500 candles warm up development; holdout starts at --split-at OPEN,
 with its own 100-USDT account and the preceding 500 historical warmup candles.
 Fixed comparisons: Always / Killzones, each at 6/2 and stressed 10/5 bps
 fees/stop slippage, plus a research-only nearest-viable-target hypothesis
-under Always at both costs. Risk, leverage, and entry rules are not tuned.
+under Always at both costs. Four extra Always profiles test a fixed one-bar
+entry embargo for both target policies and cost assumptions. This is a timing
+sensitivity test, not a real latency model. Risk and leverage are not tuned.
 Reports include source/config hashes, costs, drawdown, unclosed exposure,
 trade events, and explicit limitations. Output must not already exist.
 Results are UNVALIDATED: OHLC simulation excludes funding and liquidation.

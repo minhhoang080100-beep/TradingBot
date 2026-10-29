@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{Candle, Exchange, InstrumentId, MarketKind, RiskPlan, Timeframe, VolumeUnit};
 
-use super::{PaperBroker, PaperConfig, PaperError, PaperInstrument, PaperOrderSnapshot, PortfolioEvent};
+use super::{PaperBroker, PaperConfig, PaperError, PaperFillTiming, PaperInstrument, PaperOrderSnapshot, PortfolioEvent};
 
 const MAX_ORDERS: usize = 4;
 const MAX_SYMBOL_ORDERS: usize = 2;
@@ -158,6 +158,7 @@ struct AcceptedOrder {
 #[derive(Clone, Debug)]
 pub struct PaperBook {
     config: PaperConfig,
+    fill_timing: PaperFillTiming,
     free_cash: Decimal,
     sleeves: BTreeMap<Uuid, Sleeve>,
     accepted: Arc<BTreeMap<Uuid, AcceptedOrder>>,
@@ -176,9 +177,21 @@ impl PaperBook {
     /// # Errors
     /// Checked capital-cap arithmetic can fail for unrepresentable inputs.
     pub fn new(config: PaperConfig) -> Result<Self, BookError> {
+        Self::new_for_research(config, PaperFillTiming::ImmediateNextBar)
+    }
+
+    /// Creates an offline book with an explicit fixed bar-delay hypothesis.
+    ///
+    /// All funded sleeves inherit the same timing. This does not model actual
+    /// admission/network timestamps and must be recorded in research reports.
+    /// Default constructors and historical journal configuration stay unchanged.
+    ///
+    /// # Errors
+    /// Checked capital-cap arithmetic can fail for unrepresentable inputs.
+    pub fn new_for_research(config: PaperConfig, fill_timing: PaperFillTiming) -> Result<Self, BookError> {
         let initial = config.initial_balance();
         let mut book = Self {
-            config, free_cash: initial, sleeves: BTreeMap::new(),
+            config, fill_timing, free_cash: initial, sleeves: BTreeMap::new(),
             accepted: Arc::new(BTreeMap::new()), last_batch: None, latest_activity: None,
             settled_fees: Decimal::ZERO, settled_trades: 0, settled_wins: 0, settled_losses: 0,
             metrics: BookSnapshot {
@@ -198,6 +211,10 @@ impl PaperBook {
     #[must_use]
     pub const fn config(&self) -> &PaperConfig { &self.config }
 
+    /// Timing inherited by every independently funded research order.
+    #[must_use]
+    pub const fn fill_timing(&self) -> PaperFillTiming { self.fill_timing }
+
     /// Clones the cached, checked account snapshot with lossless decimal strings.
     #[must_use]
     pub fn snapshot(&self) -> BookSnapshot { self.metrics.clone() }
@@ -216,9 +233,9 @@ impl PaperBook {
             return if previous == &identity { Ok(Vec::new()) } else { Err(BookError::ConflictingReplay) };
         }
         self.validate_admission(&identity)?;
-        let (broker, allocation) = PaperBroker::allocate_order(self.config,
+        let (broker, allocation) = PaperBroker::allocate_order_with_timing(self.config,
             instrument.spec.clone(), instrument.min_notional, identity.plan.clone(), signal_candle,
-            self.metrics.available_cash)?;
+            self.metrics.available_cash, self.fill_timing)?;
         let order = broker.snapshot().pending.ok_or(BookError::InvalidInput("allocated entry missing"))?;
         let symbol = instrument.spec.instrument().venue_symbol.as_str().to_owned();
         let mut staged = self.clone();
@@ -542,6 +559,34 @@ mod tests {
     fn admit(book: &mut PaperBook, asset: &str, id: u128, fraction: Decimal) -> TestResult {
         let (instrument, plan, signal) = approval(asset, id, Direction::Bullish, fraction)?;
         assert!(matches!(book.admit(&instrument, plan, &signal)?.as_slice(), [PortfolioEvent::EntryPlaced { .. }]));
+        Ok(())
+    }
+
+    #[test]
+    fn research_book_propagates_embargo_to_each_funded_sleeve() -> TestResult {
+        let config = PaperConfig::default().with_leverage(10)?;
+        let mut book = PaperBook::new_for_research(config, PaperFillTiming::SkipFirstEligibleBar)?;
+        assert_eq!(book.fill_timing(), PaperFillTiming::SkipFirstEligibleBar);
+        assert_eq!(PaperBook::new(config)?.fill_timing(), PaperFillTiming::ImmediateNextBar);
+        let (_, _, btc) = approval("BTC", 1, Direction::Bullish, Decimal::new(5, 3))?;
+        let (_, _, eth) = approval("ETH", 2, Direction::Bullish, Decimal::new(5, 3))?;
+        book.advance_batch(&[btc, eth])?;
+        for (asset, id) in [("BTC", 1), ("ETH", 2)] {
+            admit(&mut book, asset, id, Decimal::new(5, 3))?;
+        }
+        let pending = book.snapshot();
+        let first = book.advance_batch(&[candle("BTC", 300, [103, 104, 101, 103])?,
+            candle("ETH", 300, [103, 104, 101, 103])?])?;
+        assert!(first.is_empty());
+        assert_eq!(book.snapshot(), pending);
+        assert!(book.sleeves.values().all(|sleeve| sleeve.broker.fill_timing() == PaperFillTiming::SkipFirstEligibleBar));
+        let later = book.advance_batch(&[candle("BTC", 360, [103, 104, 101, 103])?,
+            candle("ETH", 360, [103, 104, 101, 103])?])?;
+        assert_eq!(later.len(), 2);
+        assert!(later.iter().all(|event| matches!(event,
+            PortfolioEvent::Execution { event: super::super::PaperEvent::EntryFilled { .. }, .. })));
+        assert!(book.snapshot().orders.iter().all(|order| order.state == BookOrderState::Open));
+        assert_eq!(book.snapshot().reserved_risk, pending.reserved_risk);
         Ok(())
     }
 

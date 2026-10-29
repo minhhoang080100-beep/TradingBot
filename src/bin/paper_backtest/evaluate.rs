@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, NaiveDate, Utc};
 use ict_trading_bot::{Candle, Timeframe,
     paper::{BookOrderState, MultiPortfolio, MultiPortfolioSnapshot, MultiSymbolDiagnostics,
-        PaperConfig, PaperEntryWindow, PaperEvent, PaperTargetPolicy, PortfolioEvent}};
+        PaperConfig, PaperEntryWindow, PaperEvent, PaperFillTiming, PaperTargetPolicy, PortfolioEvent}};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 
@@ -21,15 +21,20 @@ struct Profile {
     fee_bps: u32,
     stop_bps: u32,
     target: PaperTargetPolicy,
+    fill_timing: PaperFillTiming,
 }
 
-const PROFILES: [Profile; 6] = [
-    Profile { name: "always_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest },
-    Profile { name: "always_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest },
-    Profile { name: "killzones_base", window: PaperEntryWindow::Killzones, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest },
-    Profile { name: "killzones_stressed_costs", window: PaperEntryWindow::Killzones, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest },
-    Profile { name: "research_nearest_viable_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable },
-    Profile { name: "research_nearest_viable_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable },
+const PROFILES: [Profile; 10] = [
+    Profile { name: "always_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
+    Profile { name: "always_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
+    Profile { name: "killzones_base", window: PaperEntryWindow::Killzones, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
+    Profile { name: "killzones_stressed_costs", window: PaperEntryWindow::Killzones, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
+    Profile { name: "research_nearest_viable_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar },
+    Profile { name: "research_nearest_viable_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar },
+    Profile { name: "always_delayed_one_bar_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
+    Profile { name: "always_delayed_one_bar_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
+    Profile { name: "research_nearest_viable_delayed_one_bar_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
+    Profile { name: "research_nearest_viable_delayed_one_bar_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
 ];
 
 impl Profile {
@@ -46,6 +51,7 @@ impl Profile {
             "minimum_net_rr": "2", "max_active_orders": 4, "max_active_per_symbol": 2,
             "target_policy": self.target, "target_source": "confirmed_unswept_opposing_liquidity",
             "entry_policy": "closed_candle_ce_touch_then_later_strict_trade_through",
+            "fill_timing": self.fill_timing,
             "take_profit_on_fill_candle": false,
         })
     }
@@ -168,13 +174,22 @@ fn diagnostic(row: &MultiSymbolDiagnostics) -> Value {
             "fair_value_gaps":live.fair_value_gaps,"displacement_bars":live.displacement_bars,
             "intents":live.intents,"admitted":live.admitted,"rejected":live.rejected,
             "rejection_reasons":live.rejection_reasons.iter().map(|row| json!({"reason":format!("{:?}",row.reason),"count":row.count})).collect::<Vec<_>>(),
-            "discards":live.discards.iter().map(|row| json!({"reason":format!("{:?}",row.reason),"count":row.count})).collect::<Vec<_>>()}})
+            "discards":live.discards.iter().map(|row| json!({"reason":format!("{:?}",row.reason),"count":row.count})).collect::<Vec<_>>(),
+            "admission_failures":live.admission_failures.iter().map(|row| json!({"reason":format!("{:?}",row.reason),"count":row.count})).collect::<Vec<_>>(),
+            "last_admission_failure":live.last_admission_failure.map(|failure| json!({
+                "at":failure.at,"intent_id":failure.intent_id,"reason":format!("{:?}",failure.kind),
+                "raw_target_price":failure.target_price.map(|value|value.to_string()),
+                "actual_gross_rr":failure.actual_gross_rr.map(|value|value.to_string()),
+                "required_gross_rr":failure.required_gross_rr.map(|value|value.to_string()),
+                "calculated_quantity":failure.calculated_quantity.map(|value|value.to_string()),
+                "minimum_quantity":failure.minimum_quantity.map(|value|value.to_string()),
+            }))}})
 }
 
 fn segment(data: &Dataset, start: usize, end: usize, warmup: usize, profile: Profile,
     name: &str) -> Result<Value, BoxError> {
     if start < warmup || end <= start || end > data.series[0].len() { return Err("invalid evaluation segment".into()); }
-    let mut engine = MultiPortfolio::new_for_research(data.instruments.clone(), profile.config()?, Timeframe::M1, profile.window, profile.target)?;
+    let mut engine = MultiPortfolio::new_for_research_with_fill_timing(data.instruments.clone(), profile.config()?, Timeframe::M1, profile.window, profile.target, profile.fill_timing)?;
     for index in start - warmup..start { engine.warm_up(&batch(data, index))?; }
     let mut metrics = Metrics::new();
     let mut ledger = Vec::new();
@@ -241,7 +256,7 @@ pub(super) fn report(data: &Dataset, split_at: DateTime<Utc>) -> Result<Value, B
     if split <= WARMUP || split >= first.len() { return Err("split needs nonempty development and holdout plus 500 warmup bars".into()); }
     let code = code_provenance();
     let configuration = json!({
-        "evaluation_engine":"paper-research-v1", "baseline_execution_family":"ict-paper-portfolio-v4",
+        "evaluation_engine":"paper-research-v2", "baseline_execution_family":"ict-paper-portfolio-v4",
         "compiled_sources_sha256":hash(&serde_json::to_vec(&code)?),
         "warmup_bars_per_segment":WARMUP,
         "split_at_first_holdout_open":split_at,
@@ -254,13 +269,14 @@ pub(super) fn report(data: &Dataset, split_at: DateTime<Utc>) -> Result<Value, B
         results.push(segment(data, split, first.len(), WARMUP, profile, "holdout")?);
     }
     Ok(json!({
-        "report_version":1,"status":"UNVALIDATED","configuration_sha256":hash(&serde_json::to_vec(&configuration)?),
+        "report_version":2,"status":"UNVALIDATED","configuration_sha256":hash(&serde_json::to_vec(&configuration)?),
         "configuration":configuration,"compiled_sources":code,"provenance":data.provenance,"manifest":data.manifest,
         "results":results,
         "limitations":[
             "Historical reconstruction uses the supplied metadata snapshot; historical tick/quantity/minimum filters may differ.",
             "No funding, mark-price maintenance margin, liquidation, order-book queue, partial fills or market-impact model.",
             "REST settlement, polling and admission latency are not simulated; next-bar OHLC may include prices occurring before an order could actually be admitted.",
+            "Delayed profiles skip the first complete entry-eligible bar as a fixed sensitivity test. They do not reproduce actual latency or eliminate retrospective fills during delayed-data catch-up, and cannot establish a lower bound on losses or returns.",
             "Drawdown uses candle-close equity; it is not a complete intrabar drawdown or liquidation-risk measure.",
             "Holdout is chronological, with a fresh 100-USDT account and preceding-only warmup. Development and holdout returns must not be compounded as one account.",
             "All candidate profiles are fixed before evaluation. Comparing several profiles on the same holdout does not make a chosen winner independently validated.",
@@ -344,7 +360,7 @@ mod tests {
         prices.extend([[109,110,103,109],[110,151,109,150]]);
         let data=fixture(&prices)?;
         let result=report(&data,at(i64::try_from(split)?)?)?;
-        assert_eq!(result["results"].as_array().ok_or("results")?.len(),12);
+        assert_eq!(result["results"].as_array().ok_or("results")?.len(),PROFILES.len()*2);
         let dev=&result["results"][0];
         let hold=&result["results"][1];
         assert_eq!(dev["metrics"]["pending_at_end"],1);
@@ -356,7 +372,26 @@ mod tests {
         prices[split]=[100,102,98,101];
         prices[split+1]=[100,102,98,101];
         let changed=report(&fixture(&prices)?,at(i64::try_from(split)?)?)?;
-        for index in [0,2,4,6,8,10] { assert_eq!(result["results"][index],changed["results"][index]); }
+        for index in (0..PROFILES.len()*2).step_by(2) { assert_eq!(result["results"][index],changed["results"][index]); }
+        Ok(())
+    }
+
+    #[test]
+    fn delayed_profile_embargo_reaches_actual_portfolio_execution() -> Result<(),BoxError> {
+        let mut prices=vec![[100,102,98,101];WARMUP];
+        prices.extend(setup());
+        prices.push([109,110,103,109]);
+        let data=fixture(&prices)?;
+        let default=segment(&data,WARMUP,prices.len(),WARMUP,PROFILES[0],"fixture")?;
+        let delayed=segment(&data,WARMUP,prices.len(),WARMUP,PROFILES[6],"fixture")?;
+        assert_eq!(default["metrics"]["open_positions_at_end"],1);
+        assert_eq!(delayed["metrics"]["open_positions_at_end"],0);
+        assert_eq!(delayed["metrics"]["pending_at_end"],1);
+        assert_eq!(delayed["metrics"]["fees_paid"],"0");
+        prices.push([109,110,103,109]);
+        let later=segment(&fixture(&prices)?,WARMUP,prices.len(),WARMUP,PROFILES[6],"fixture")?;
+        assert_eq!(later["metrics"]["open_positions_at_end"],1);
+        assert_eq!(later["metrics"]["filled_entries"],1);
         Ok(())
     }
 

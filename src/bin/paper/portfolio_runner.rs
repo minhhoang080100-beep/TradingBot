@@ -86,16 +86,17 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
             result = &mut *shutdown => {
                 result?;
                 let at = Utc::now();
-                let events = engine.shutdown(at)?;
-                let snapshot = engine.snapshot();
-                tokio::task::block_in_place(|| log.finish(at, "shutdown_signal", &snapshot, &events))?;
+                let (snapshot, _) = tokio::task::block_in_place(|| finish_session_log(
+                    &mut engine, &mut log, at, "shutdown_signal"))?;
                 notify(notifier, status_message(session, "STOPPED during warmup", recent.back().and_then(|batch: &Vec<Candle>| batch.first()).map(Candle::close_time), &snapshot));
                 return Ok(());
             }
             () = tokio::task::yield_now() => {}
         }
-        let step = engine.warm_up(&batch)?;
-        tokio::task::block_in_place(|| log.append(&batch, true, &step))?;
+        if let Err(error) = tokio::task::block_in_place(|| log.process_batch(&mut engine, &batch, true)) {
+            tokio::task::block_in_place(|| finish_session_log(&mut engine, &mut log, Utc::now(), "error"))?;
+            return Err(error);
+        }
         retain(&mut recent, batch);
     }
     // Startup retries are resolved only after the complete warmup is journaled.
@@ -108,26 +109,36 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
         notifier, session, shutdown, &mut recovery_state).await;
     let reason = outcome.as_ref().map_or("error", |reason| *reason);
     let at = Utc::now();
-    let failed_engine = engine.is_poisoned();
-    let events = match engine.shutdown(at) {
-        Ok(events) => events,
-        Err(error) => {
-            tokio::task::block_in_place(|| log.abort(at, "error", &engine.snapshot(), &[]))?;
-            return Err(error.into());
-        }
-    };
-    let snapshot = engine.snapshot();
-    tokio::task::block_in_place(|| {
-        if failed_engine { log.abort(at, "error", &snapshot, &events) }
-        else { log.finish(at, reason, &snapshot, &events) }
-    })?;
-    if failed_engine { eprintln!("Portfolio engine failed; aborted journal is diagnostic-only, not replay-complete."); }
+    let (snapshot, events) = tokio::task::block_in_place(|| finish_session_log(
+        &mut engine, &mut log, at, reason))?;
     publish_events(notifier, session, &events, &snapshot, options.config, false);
     println!("Stopped ({reason}); portfolio open positions are marked, not forcibly closed.");
     println!("{}", serde_json::to_string(&snapshot)?);
     notify(notifier, status_message(session, reason, Some(cursor), &snapshot));
     *stopped_notice_attempted = true;
     outcome.map(|_| ())
+}
+
+// A failed append after an engine transition is as non-replayable as a failed
+// engine transition. Capacity rejected before processing remains reproducible.
+pub(super) fn finish_session_log(engine: &mut PaperPortfolio, log: &mut PortfolioLog,
+    at: DateTime<Utc>, reason: &str) -> Result<(PortfolioSnapshot, Vec<PortfolioEvent>), BoxError> {
+    let must_abort = engine.is_poisoned() || log.requires_abort();
+    let events = match engine.shutdown(at) {
+        Ok(events) => events,
+        Err(error) => {
+            log.abort(at, "error", &engine.snapshot(), &[])?;
+            return Err(error.into());
+        }
+    };
+    let snapshot = engine.snapshot();
+    if must_abort {
+        log.abort(at, "error", &snapshot, &events)?;
+        eprintln!("Portfolio transition or journal commit failed; aborted journal is diagnostic-only, not replay-complete.");
+    } else {
+        log.finish(at, reason, &snapshot, &events)?;
+    }
+    Ok((snapshot, events))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -199,9 +210,9 @@ async fn collect(
         for batch in batches {
             ensure_joint_feed_current(*cursor, stale_at)?;
             let at = batch.first().ok_or("empty synchronized batch")?.close_time();
-            let step = engine.process_batch(&batch)?;
-            // Journal evidence precedes best-effort external notification.
-            tokio::task::block_in_place(|| log.append(&batch, false, &step))?;
+            // Capacity is checked before advancing the engine, and durable
+            // journal evidence precedes best-effort external notification.
+            let step = tokio::task::block_in_place(|| log.process_batch(engine, &batch, false))?;
             // Complete inputs/outcomes remain in the fsynced journal above.
             // Console output summarizes idle bars; lifecycle evidence is still
             // emitted in full when an actual order event occurs.
@@ -226,11 +237,14 @@ fn compact_batch_log(at: DateTime<Utc>, step: &ict_trading_bot::paper::MultiPort
 ) -> String {
     let account = &step.snapshot.account;
     let symbols = step.analysis.iter().map(|analysis| {
-        let stage = diagnostics.iter().find(|row| row.symbol == analysis.symbol)
-            .map_or_else(|| "unknown".to_owned(), |row| format!("{:?}", row.discovery_stage));
+        let diagnostic = diagnostics.iter().find(|row| row.symbol == analysis.symbol);
+        let stage = diagnostic.map_or_else(|| "unknown".to_owned(), |row| format!("{:?}", row.discovery_stage));
+        let detail = diagnostic.and_then(|row| row.live.last_admission_failure)
+            .filter(|failure| failure.at == at)
+            .map_or_else(String::new, |failure| format!(" admission={:?} ({})", failure.kind, admission_failure_detail(failure)));
         let rejected = if analysis.rejection_reasons.is_empty() { String::new() }
             else { format!(" {:?}", analysis.rejection_reasons) };
-        format!("{} signals={} intents={} rejected={}{rejected} stage={stage}",
+        format!("{} signals={} intents={} rejected={}{rejected} stage={stage}{detail}",
             analysis.symbol, analysis.signals, analysis.intents, analysis.rejected)
     }).collect::<Vec<_>>().join(" | ");
     format!("PAPER M1 close={} balance={} equity={} active={}/4 risk={} halted={} | {symbols}",
@@ -522,11 +536,51 @@ fn setup_digest(item: &ict_trading_bot::paper::MultiSymbolDiagnostics) -> String
         StrategyStage::InPosition => "đang có vị thế",
     };
     let stats = &item.live;
-    let rejection = dominant_reason(&stats.rejection_reasons, rejection_label);
+    let rejection = if stats.admission_failures.is_empty() {
+        dominant_reason(&stats.rejection_reasons, rejection_label)
+    } else { dominant_reason(&stats.admission_failures, admission_failure_label) };
+    let rejection_scope = if stats.admission_failures.is_empty() { "Lý do từ chối nhiều nhất" }
+        else { "Lý do không nhận intent nhiều nhất" };
     let discard = dominant_reason(&stats.discards, discard_label);
-    format!("{}: {stage}\n  Setup đủ chuỗi: {} | Limit nhận: {} | Từ chối: {}\n  Tín hiệu: sweep {} / MSS {} / FVG {}\n  Lý do từ chối nhiều nhất: {rejection}\n  Setup bị loại nhiều nhất: {discard}",
+    let last_failure = stats.last_admission_failure.map_or_else(String::new, |failure| {
+        format!("\n  Lần từ chối gần nhất {}: {}", vietnam_time(failure.at), admission_failure_detail(failure))
+    });
+    format!("{}: {stage}\n  Setup đủ chuỗi: {} | Limit nhận: {} | Từ chối: {}\n  Tín hiệu: sweep {} / MSS {} / FVG {}\n  {rejection_scope}: {rejection}\n  Setup bị loại nhiều nhất: {discard}{last_failure}",
         item.symbol, stats.intents, stats.admitted, stats.rejected, stats.liquidity_sweeps,
         stats.market_structure_shifts, stats.fair_value_gaps)
+}
+
+fn admission_failure_label(kind: ict_trading_bot::paper::AdmissionFailureKind) -> &'static str {
+    use ict_trading_bot::paper::AdmissionFailureKind as K;
+    match kind {
+        K::GrossRiskReward => "RR trước phí không đạt",
+        K::NetRiskReward => "RR sau chi phí không đạt",
+        K::InvalidPriceGeometry => "Entry/SL/TP sau làm tròn không hợp lệ",
+        K::QuantityBelowMinimum => "khối lượng tính theo risk dưới mức tối thiểu",
+        K::IntentExpired => "setup đã hết hạn",
+        K::CircuitBreaker => "đã chạm ngưỡng lỗ ngày",
+        K::PortfolioRisk => "hết hạn mức rủi ro chung",
+        K::GlobalSlots => "đã đủ 4 lệnh", K::SymbolSlots => "cặp đã đủ 2 lệnh",
+        K::OpposingDirection => "đã có lệnh ngược chiều",
+        K::MinimumOrder => "không đạt giá trị/khối lượng lệnh tối thiểu",
+        K::InsufficientBalance => "thiếu vốn ký quỹ và phí",
+        K::BrokerBusy => "bộ mô phỏng đang bận",
+        K::NoOpposingLiquidity => "thiếu thanh khoản đối diện để đặt TP",
+        K::DuplicateSetup => "setup đã được xét",
+        K::SessionHalted => "phiên đang chặn lệnh mới",
+    }
+}
+
+fn admission_failure_detail(failure: ict_trading_bot::paper::AdmissionFailureDiagnostic) -> String {
+    if let (Some(actual), Some(required)) = (failure.actual_gross_rr, failure.required_gross_rr) {
+        // Keep exact values: rounding 1.999 to 2.00 would misrepresent why the
+        // comparison failed. This observer never changes risk arithmetic.
+        return format!("RR trước phí {}:1; cần ≥{}:1", actual.normalize(), required.normalize());
+    }
+    if let (Some(calculated), Some(minimum)) = (failure.calculated_quantity, failure.minimum_quantity) {
+        return format!("KL {}; tối thiểu {}", calculated.normalize(), minimum.normalize());
+    }
+    admission_failure_label(failure.kind).to_owned()
 }
 
 fn dominant_reason<R: Copy>(counts: &[ict_trading_bot::paper::DiagnosticCount<R>], label: impl Fn(R) -> &'static str) -> String {
@@ -841,6 +895,12 @@ mod notification_tests {
                 intents: u64::MAX, admitted: u64::MAX, rejected: u64::MAX,
                 rejection_reasons: vec![DiagnosticCount { reason: MultiRejection::NoOpposingLiquidity, count: u64::MAX }],
                 discards: vec![DiagnosticCount { reason: SetupDiscardReason::EntryTouchedOutsideKillzone, count: u64::MAX }],
+                admission_failures: Vec::new(),
+                last_admission_failure: Some(ict_trading_bot::paper::AdmissionFailureDiagnostic {
+                    at: at(419)?, intent_id: Uuid::nil(), kind: ict_trading_bot::paper::AdmissionFailureKind::GrossRiskReward,
+                    target_price: Some(Decimal::MAX), actual_gross_rr: Some(Decimal::MAX), required_gross_rr: Some(Decimal::MAX),
+                    calculated_quantity: None, minimum_quantity: None,
+                }),
             },
         })
     }
@@ -860,6 +920,29 @@ mod notification_tests {
         assert!(message.contains("Setup bị loại nhiều nhất: chưa có"));
         assert!(!message.contains("NoOpposingLiquidity"));
         assert!(!message.contains("ĐÃ KHỚP"));
+        Ok(())
+    }
+
+    #[test]
+    fn admission_diagnostic_preserves_exact_rr_and_marks_historical_time() -> Result<(), BoxError> {
+        use ict_trading_bot::paper::{AdmissionFailureKind, DiagnosticCount};
+        let mut row = max_diagnostic("BTCUSDT")?;
+        let failure = row.live.last_admission_failure.as_mut().ok_or("missing fixture failure")?;
+        failure.actual_gross_rr = Some(Decimal::new(19999, 4));
+        failure.required_gross_rr = Some(Decimal::TWO);
+        row.live.admission_failures = vec![DiagnosticCount { reason: AdmissionFailureKind::GrossRiskReward, count: 3 }];
+        row.live.rejection_reasons = vec![DiagnosticCount { reason: ict_trading_bot::paper::MultiRejection::StrategyInput, count: 100 }];
+        let message = setup_digest(&row);
+        assert!(message.contains("Lý do không nhận intent nhiều nhất: RR trước phí không đạt (3)"));
+        assert!(message.contains("RR trước phí không đạt (3)"));
+        assert!(message.contains("RR trước phí 1.9999:1; cần ≥2:1"));
+        assert!(message.contains(&format!("Lần từ chối gần nhất {}", vietnam_time(at(419)?))));
+        assert!(!message.contains("RR sau chi phí 1.9999"));
+        let failure = row.live.last_admission_failure.as_mut().ok_or("missing fixture failure")?;
+        failure.kind = AdmissionFailureKind::NetRiskReward;
+        failure.actual_gross_rr = None;
+        failure.required_gross_rr = None;
+        assert_eq!(admission_failure_detail(*failure), "RR sau chi phí không đạt");
         Ok(())
     }
 
@@ -912,6 +995,7 @@ mod notification_tests {
             intents: 2, admitted: 1, rejected: 1,
             rejection_reasons: vec![DiagnosticCount { reason: MultiRejection::NetRiskReward, count: 1 }],
             discards: vec![DiagnosticCount { reason: SetupDiscardReason::TimeToLiveExpired, count: 2 }],
+            admission_failures: Vec::new(), last_admission_failure: None,
         };
         let message = setup_counters_message(Uuid::from_u128(7), &row);
         for required in ["[PAPER] SETUP COUNTERS / BTCUSDT", "Live candles: 6",
@@ -949,6 +1033,7 @@ mod notification_tests {
                     intents: u64::MAX, admitted: u64::MAX, rejected: u64::MAX,
                     rejection_reasons: rejections.iter().map(|reason| DiagnosticCount { reason: *reason, count: u64::MAX }).collect(),
                     discards: discards.iter().map(|reason| DiagnosticCount { reason: *reason, count: u64::MAX }).collect(),
+                    admission_failures: Vec::new(), last_admission_failure: None,
                 },
             };
             let message = setup_counters_message(Uuid::from_u128(7), &row);

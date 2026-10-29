@@ -161,6 +161,9 @@ pub struct MultiLog {
     last_close: Option<DateTime<Utc>>,
     finished: bool,
     poisoned: bool,
+    // An engine transition exists which has not reached durable storage.
+    // Such a session must never receive an apparently replayable summary.
+    uncommitted_outcome: bool,
 }
 
 impl MultiLog {
@@ -181,10 +184,49 @@ impl MultiLog {
             last_close: None,
             finished: false,
             poisoned: false,
+            uncommitted_outcome: false,
         };
         log.write(&bytes)?;
         Ok(log)
     }
+
+    /// Applies a batch only while a maximum-sized record and terminal record
+    /// still fit. The terminal reserve permits an auditable capacity stop.
+    ///
+    /// # Errors
+    /// Rejects exhausted/failed journals before advancing the engine. A later
+    /// append failure marks the session diagnostic-only; I/O failure may also
+    /// prevent writing any terminal record at all.
+    pub fn process_batch(&mut self, engine: &mut MultiPortfolio, candles: &[Candle],
+        warmup: bool) -> Result<MultiPortfolioStep, BoxError> {
+        self.check_batch_capacity()?;
+        let step = if warmup { engine.warm_up(candles)? } else { engine.process_batch(candles)? };
+        self.record_applied_batch(candles, warmup, &step)?;
+        Ok(step)
+    }
+
+    fn check_batch_capacity(&self) -> Result<(), BoxError> {
+        if self.finished || self.poisoned || self.uncommitted_outcome {
+            return Err(invalid("multi-order journal cannot accept another engine transition"));
+        }
+        let reserve = 2 * u64::try_from(MAX_LINE)?;
+        if self.batches >= MAX_BATCHES || MAX_BYTES.saturating_sub(self.bytes) < reserve {
+            return Err(invalid("multi-order journal capacity reached; terminal space reserved"));
+        }
+        Ok(())
+    }
+
+    fn record_applied_batch(&mut self, candles: &[Candle], warmup: bool,
+        step: &MultiPortfolioStep) -> Result<(), BoxError> {
+        self.uncommitted_outcome = true;
+        self.append(candles, warmup, step)?;
+        self.uncommitted_outcome = false;
+        Ok(())
+    }
+
+    /// True when an applied outcome failed to commit. This is distinct from a
+    /// capacity preflight rejection, which leaves the engine unchanged.
+    pub fn requires_abort(&self) -> bool { self.uncommitted_outcome }
 
     /// Records one complete market batch and its already-computed outcome.
     ///
@@ -223,6 +265,9 @@ impl MultiLog {
         snapshot: &MultiPortfolioSnapshot,
         events: &[PortfolioEvent],
     ) -> Result<(), BoxError> {
+        if self.uncommitted_outcome {
+            return Err(invalid("uncommitted engine outcome requires an aborted journal"));
+        }
         validate_summary(at, reason, self.last_close)?;
         self.write(&encode(&Record::Summary {
             at,
@@ -971,6 +1016,86 @@ mod tests {
         assert!(is_multi(&input)?);
         let error = replay(&input, &output).err().ok_or("aborted replay succeeded")?;
         assert!(error.to_string().contains("diagnostic-only"));
+        assert!(!output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn capacity_preflight_preserves_engine_and_room_for_replayable_shutdown() -> Result<(), BoxError> {
+        let temp = Temp::new()?;
+        for (label, exhaust_batches) in [("batches", true), ("bytes", false)] {
+            let header = header()?;
+            let mut engine = header.engine()?;
+            let input = temp.path(&format!("capacity-{label}.jsonl"));
+            let mut log = MultiLog::create(&input, &header)?;
+            let before = fs::read(&input)?;
+            if exhaust_batches { log.batches = MAX_BATCHES; }
+            else { log.bytes = MAX_BYTES - u64::try_from(MAX_LINE)?; }
+            assert!(log.process_batch(&mut engine, &batch(0)?, false).is_err());
+            assert_eq!(fs::read(&input)?, before);
+            assert!(!engine.is_poisoned());
+            assert!(!log.requires_abort());
+            assert!(engine.diagnostics().iter().all(|row| row.last_close.is_none()));
+            let (snapshot, _) = super::super::portfolio_runner::finish_session_log(
+                &mut engine, &mut log, at(61)?, "error")?;
+            let output = temp.path(&format!("capacity-{label}-replay.jsonl"));
+            assert_eq!(replay(&input, &output)?, snapshot);
+            assert_eq!(fs::read(&input)?, fs::read(&output)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn applied_but_unwritten_outcome_cannot_be_finished_as_a_normal_session() -> Result<(), BoxError> {
+        let temp = Temp::new()?;
+        let header = header()?;
+        let mut engine = header.engine()?;
+        let input = temp.path("uncommitted.jsonl");
+        let mut log = MultiLog::create(&input, &header)?;
+        let candles = batch(0)?;
+        let step = engine.process_batch(&candles)?;
+        // Simulate a pre-I/O append rejection after the engine has advanced.
+        // This exercises the same commit boundary used by process_batch.
+        log.batches = MAX_BATCHES;
+        assert!(log.record_applied_batch(&candles, false, &step).is_err());
+        assert!(log.requires_abort());
+        assert!(log.check_batch_capacity().is_err());
+        assert!(log.finish(at(61)?, "error", &engine.snapshot(), &[]).is_err());
+        super::super::portfolio_runner::finish_session_log(&mut engine, &mut log, at(61)?, "error")?;
+        let rows = records(&input)?;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1]["record"], "aborted");
+        let output = temp.path("uncommitted-replay.jsonl");
+        let error = replay(&input, &output).err().ok_or("aborted replay succeeded")?;
+        assert!(error.to_string().contains("diagnostic-only"));
+        assert!(!output.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn io_failure_after_advance_leaves_an_incomplete_poisoned_journal() -> Result<(), BoxError> {
+        let temp = Temp::new()?;
+        let header = header()?;
+        let mut engine = header.engine()?;
+        let input = temp.path("io-failure.jsonl");
+        let mut log = MultiLog::create(&input, &header)?;
+        let before = fs::read(&input)?;
+        // Read-only handle forces an actual write error without disk damage.
+        log.file = File::open(&input)?;
+        assert!(log.process_batch(&mut engine, &batch(0)?, false).is_err());
+        let processed_at = at(60)?;
+        assert!(engine.diagnostics().iter().all(|row| row.last_close == Some(processed_at)));
+        assert!(log.requires_abort());
+        assert!(log.poisoned);
+        let events = engine.shutdown(at(61)?)?;
+        let snapshot = engine.snapshot();
+        assert!(log.finish(at(61)?, "error", &snapshot, &events).is_err());
+        assert!(log.abort(at(61)?, "error", &snapshot, &events).is_err());
+        assert!(super::super::portfolio_runner::finish_session_log(
+            &mut engine, &mut log, at(61)?, "error").is_err());
+        assert_eq!(fs::read(&input)?, before);
+        let output = temp.path("io-failure-replay.jsonl");
+        assert!(replay(&input, &output).is_err());
         assert!(!output.exists());
         Ok(())
     }

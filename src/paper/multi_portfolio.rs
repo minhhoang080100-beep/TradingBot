@@ -23,7 +23,7 @@ use crate::{
 
 use super::{
     book::{BookError, BookSnapshot, PaperBook},
-    broker::{PaperConfig, PaperError, PaperEvent},
+    broker::{PaperConfig, PaperError, PaperEvent, PaperFillTiming},
     market::PaperInstrument,
     portfolio::{PortfolioError, PortfolioEvent},
 };
@@ -119,6 +119,72 @@ pub struct DiagnosticCount<R> {
     pub count: u64,
 }
 
+/// Exact terminal admission failure, separate from the stable journal categories.
+///
+/// This finite enum bounds diagnostic storage. It describes the error actually
+/// returned by admission, not a guess based on a setup that never became an intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionFailureKind {
+    /// Rounded target reward is below the risk manager's gross RR floor.
+    GrossRiskReward,
+    /// Fees and stop slippage leave insufficient net reward/risk.
+    NetRiskReward,
+    /// Rounded entry, stop or target no longer has valid directional geometry.
+    InvalidPriceGeometry,
+    /// Risk-sized quantity is below the instrument's minimum quantity.
+    QuantityBelowMinimum,
+    /// The intent expired before admission.
+    IntentExpired,
+    /// The risk manager's daily circuit breaker is tripped.
+    CircuitBreaker,
+    /// The shared portfolio has insufficient remaining risk capacity.
+    PortfolioRisk,
+    /// Four pending/open slots are already used.
+    GlobalSlots,
+    /// Two pending/open slots are already used for this symbol.
+    SymbolSlots,
+    /// This symbol already has exposure in the opposite direction.
+    OpposingDirection,
+    /// Broker sizing cannot satisfy minimum quantity or notional.
+    MinimumOrder,
+    /// Margin and fee reserves cannot be funded from available cash.
+    InsufficientBalance,
+    /// The broker reported an existing pending entry or position.
+    BrokerBusy,
+    /// No confirmed, unswept opposing liquidity target exists.
+    NoOpposingLiquidity,
+    /// This MSS/FVG setup has already been consumed.
+    DuplicateSetup,
+    /// The session is already blocking new risk.
+    SessionHalted,
+}
+
+/// Most recent rejected live intent, retained as historical context only.
+///
+/// Decimal values are copied from the actual error, without re-running sizing.
+/// The broker does not return a numeric net RR; a net-RR rejection therefore
+/// deliberately has no invented actual ratio. Research keeps only the terminal
+/// failed target, and records nothing if a later target admits the intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionFailureDiagnostic {
+    /// Candle close when the intent was rejected, not notification wall time.
+    pub at: DateTime<Utc>,
+    /// Full immutable intent identity; display layers may abbreviate it.
+    pub intent_id: Uuid,
+    /// Exact terminal admission failure.
+    pub kind: AdmissionFailureKind,
+    /// Raw confirmed liquidity target, before risk-manager tick rounding.
+    pub target_price: Option<Decimal>,
+    /// Gross RR after rounding, when supplied by the risk-manager error.
+    pub actual_gross_rr: Option<Decimal>,
+    /// Gross RR floor associated with `actual_gross_rr`.
+    pub required_gross_rr: Option<Decimal>,
+    /// Rounded risk-sized quantity, when below the instrument minimum.
+    pub calculated_quantity: Option<Decimal>,
+    /// Instrument minimum associated with `calculated_quantity`.
+    pub minimum_quantity: Option<Decimal>,
+}
+
 /// Live-only cumulative observations outside the versioned execution journal.
 ///
 /// Raw detector events are independent observations, not a linked trading setup.
@@ -148,6 +214,10 @@ pub struct LiveSetupCounters {
     pub rejection_reasons: Vec<DiagnosticCount<MultiRejection>>,
     /// Exact pre-intent discovery discard categories and their observed counts.
     pub discards: Vec<DiagnosticCount<SetupDiscardReason>>,
+    /// Terminal rejected-intent counts, bounded by the finite failure enum.
+    pub admission_failures: Vec<DiagnosticCount<AdmissionFailureKind>>,
+    /// Last rejected live intent; not evidence that its condition is still active.
+    pub last_admission_failure: Option<AdmissionFailureDiagnostic>,
 }
 
 impl LiveSetupCounters {
@@ -185,6 +255,11 @@ impl LiveSetupCounters {
         let admitted = events.iter().filter(|event| matches!(event,
             PortfolioEvent::EntryPlaced { symbol, .. } if symbol == &analysis.symbol)).count();
         self.admitted = self.admitted.saturating_add(count_as_u64(admitted));
+    }
+
+    fn observe_admission_failure(&mut self, failure: AdmissionFailureDiagnostic) {
+        increment_reason(&mut self.admission_failures, failure.kind);
+        self.last_admission_failure = Some(failure);
     }
 }
 
@@ -271,6 +346,75 @@ impl MultiSymbolAnalysis {
     fn reject(&mut self, reason: MultiRejection) {
         self.rejected += 1;
         self.rejection_reasons.push(reason);
+    }
+}
+
+struct RejectedAdmission {
+    reason: MultiRejection,
+    diagnostic: Option<AdmissionFailureDiagnostic>,
+}
+
+impl RejectedAdmission {
+    fn simple(reason: MultiRejection, intent: &TradeIntent, at: DateTime<Utc>,
+        target_price: Option<Decimal>,
+    ) -> Self {
+        let kind = match reason {
+            MultiRejection::DuplicateSetup => Some(AdmissionFailureKind::DuplicateSetup),
+            MultiRejection::Halted => Some(AdmissionFailureKind::SessionHalted),
+            MultiRejection::GlobalSlots => Some(AdmissionFailureKind::GlobalSlots),
+            MultiRejection::SymbolSlots => Some(AdmissionFailureKind::SymbolSlots),
+            MultiRejection::OpposingDirection => Some(AdmissionFailureKind::OpposingDirection),
+            MultiRejection::PortfolioRisk => Some(AdmissionFailureKind::PortfolioRisk),
+            MultiRejection::NoOpposingLiquidity => Some(AdmissionFailureKind::NoOpposingLiquidity),
+            MultiRejection::MinimumOrder => Some(AdmissionFailureKind::MinimumOrder),
+            MultiRejection::InsufficientBalance => Some(AdmissionFailureKind::InsufficientBalance),
+            MultiRejection::NetRiskReward => Some(AdmissionFailureKind::NetRiskReward),
+            MultiRejection::Warmup | MultiRejection::RiskRule | MultiRejection::StrategyInput => None,
+        };
+        Self { reason, diagnostic: kind.map(|kind| Self::detail(kind, intent, at, target_price)) }
+    }
+
+    fn detail(kind: AdmissionFailureKind, intent: &TradeIntent, at: DateTime<Utc>,
+        target_price: Option<Decimal>,
+    ) -> AdmissionFailureDiagnostic {
+        AdmissionFailureDiagnostic { at, intent_id: intent.id(), kind, target_price,
+            actual_gross_rr: None, required_gross_rr: None,
+            calculated_quantity: None, minimum_quantity: None }
+    }
+
+    fn risk(error: &RiskError, intent: &TradeIntent, target: &LiquidityTarget, at: DateTime<Utc>) -> Self {
+        let reason = if *error == RiskError::PortfolioRiskLimitReached { MultiRejection::PortfolioRisk }
+            else { MultiRejection::RiskRule };
+        let kind = match error {
+            RiskError::CircuitBreakerTripped => AdmissionFailureKind::CircuitBreaker,
+            RiskError::IntentExpired => AdmissionFailureKind::IntentExpired,
+            RiskError::InvalidPriceGeometry => AdmissionFailureKind::InvalidPriceGeometry,
+            RiskError::MinimumRiskRewardNotMet { .. } => AdmissionFailureKind::GrossRiskReward,
+            RiskError::PortfolioRiskLimitReached => AdmissionFailureKind::PortfolioRisk,
+            RiskError::QuantityBelowMinimum { .. } => AdmissionFailureKind::QuantityBelowMinimum,
+            _ => return Self { reason, diagnostic: None },
+        };
+        let mut diagnostic = Self::detail(kind, intent, at, Some(target.price()));
+        match error {
+            RiskError::MinimumRiskRewardNotMet { actual, required } => {
+                diagnostic.actual_gross_rr = Some(*actual);
+                diagnostic.required_gross_rr = Some(*required);
+            }
+            RiskError::QuantityBelowMinimum { calculated, minimum } => {
+                diagnostic.calculated_quantity = Some(*calculated);
+                diagnostic.minimum_quantity = Some(*minimum);
+            }
+            _ => {}
+        }
+        Self { reason, diagnostic: Some(diagnostic) }
+    }
+
+    fn book(error: &BookError, intent: &TradeIntent, target: &LiquidityTarget, at: DateTime<Utc>) -> Self {
+        let mut rejected = Self::simple(book_rejection(error), intent, at, Some(target.price()));
+        if *error == BookError::Broker(PaperError::Busy) {
+            rejected.diagnostic = Some(Self::detail(AdmissionFailureKind::BrokerBusy, intent, at, Some(target.price())));
+        }
+        rejected
     }
 }
 
@@ -464,6 +608,22 @@ impl MultiPortfolio {
     pub fn new_for_research(instruments: Vec<PaperInstrument>, config: PaperConfig,
         timeframe: Timeframe, entry_window: PaperEntryWindow, target_policy: PaperTargetPolicy,
     ) -> Result<Self, MultiPortfolioError> {
+        Self::new_for_research_with_fill_timing(instruments, config, timeframe, entry_window,
+            target_policy, PaperFillTiming::ImmediateNextBar)
+    }
+
+    /// Creates an offline experiment with explicit target and entry-timing policies.
+    ///
+    /// A fixed one-bar embargo is only a sensitivity test, not a model of actual
+    /// admission timestamps or delayed-feed catch-up. Live and replay defaults
+    /// remain unchanged; research reports must record both policies.
+    ///
+    /// # Errors
+    /// Rejects unsupported/duplicate instruments, non-M1 input and bad metadata.
+    pub fn new_for_research_with_fill_timing(instruments: Vec<PaperInstrument>, config: PaperConfig,
+        timeframe: Timeframe, entry_window: PaperEntryWindow, target_policy: PaperTargetPolicy,
+        fill_timing: PaperFillTiming,
+    ) -> Result<Self, MultiPortfolioError> {
         if instruments.is_empty() || instruments.len() > 2 || timeframe != Timeframe::M1 {
             return Err(PortfolioError::Configuration("expected one or two M1 instruments").into());
         }
@@ -491,7 +651,7 @@ impl MultiPortfolio {
             }
         }
         Ok(Self { symbols, owners: BTreeMap::new(), consumed_mss: BTreeSet::new(),
-            consumed_fvg: BTreeSet::new(), timeframe, entry_window, target_policy, risk, book: PaperBook::new(config)?,
+            consumed_fvg: BTreeSet::new(), timeframe, entry_window, target_policy, risk, book: PaperBook::new_for_research(config, fill_timing)?,
             history: BTreeMap::new(), phase: Phase::WarmingUp, insolvent: false })
     }
 
@@ -502,6 +662,10 @@ impl MultiPortfolio {
     /// Reports the explicit research policy; ordinary sessions return `Nearest`.
     #[must_use]
     pub const fn target_policy(&self) -> PaperTargetPolicy { self.target_policy }
+
+    /// Reports the fixed research timing; ordinary live/replay sessions are immediate.
+    #[must_use]
+    pub const fn fill_timing(&self) -> PaperFillTiming { self.book.fill_timing() }
 
     /// Initializes symbol contexts without creating historical orders or fills.
     ///
@@ -617,9 +781,10 @@ impl MultiPortfolio {
             self.advance_owners(symbol, &event, analysis, &mut step.events)?;
             let actions = self.state_mut(symbol)?.discovery.process_event(event)?;
             if let Some(counters) = &mut live { counters.observe_actions(&actions); }
-            self.discovery_actions(symbol, actions, candle, warmup, analysis, &mut step.events)?;
+            let admission_failures = self.discovery_actions(symbol, actions, candle, warmup, analysis, &mut step.events)?;
             if let Some(mut counters) = live {
                 counters.observe_outcome(analysis, &step.events);
+                for failure in admission_failures { counters.observe_admission_failure(failure); }
                 live_updates.push(counters);
             }
         }
@@ -719,7 +884,8 @@ impl MultiPortfolio {
     }
 
     fn discovery_actions(&mut self, symbol: &str, actions: Vec<StrategyAction>, candle: &Candle,
-        warmup: bool, analysis: &mut MultiSymbolAnalysis, events: &mut Vec<PortfolioEvent>) -> Result<(), MultiPortfolioError> {
+        warmup: bool, analysis: &mut MultiSymbolAnalysis, events: &mut Vec<PortfolioEvent>) -> Result<Vec<AdmissionFailureDiagnostic>, MultiPortfolioError> {
+        let mut failures = Vec::new();
         for action in actions {
             match action {
                 StrategyAction::TradeIntentGenerated(intent) => {
@@ -730,8 +896,9 @@ impl MultiPortfolio {
                     let state = self.state_mut(symbol)?;
                     let owner = IntentOwner { key: state.key.clone(), strategy: std::mem::replace(
                         &mut state.discovery, StrategyEngine::new(strategy_config)) };
-                    if let Some(reason) = self.submit_intent(symbol, &intent, owner, candle, warmup, events)? {
-                        analysis.reject(reason);
+                    if let Some(rejected) = self.submit_intent(symbol, &intent, owner, candle, warmup, events)? {
+                        analysis.reject(rejected.reason);
+                        if let Some(diagnostic) = rejected.diagnostic { failures.push(diagnostic); }
                     }
                 }
                 StrategyAction::InputRejected { .. } => analysis.reject(MultiRejection::StrategyInput),
@@ -742,7 +909,7 @@ impl MultiPortfolio {
                 _ => return Err(PortfolioError::Invariant("discovery emitted an owned lifecycle").into()),
             }
         }
-        Ok(())
+        Ok(failures)
     }
 
     fn consume_setup(&mut self, key: &CandleKey, intent: &TradeIntent) -> Result<bool, PortfolioError> {
@@ -766,7 +933,7 @@ impl MultiPortfolio {
     }
 
     fn submit_intent(&mut self, symbol: &str, intent: &TradeIntent, mut owner: IntentOwner,
-        candle: &Candle, warmup: bool, events: &mut Vec<PortfolioEvent>) -> Result<Option<MultiRejection>, MultiPortfolioError> {
+        candle: &Candle, warmup: bool, events: &mut Vec<PortfolioEvent>) -> Result<Option<RejectedAdmission>, MultiPortfolioError> {
         let at = candle.close_time();
         if intent.instrument() != &owner.key.instrument || owner.key != self.state(symbol)?.key
             || owner.strategy.pending_intent(&owner.key).map(TradeIntent::id) != Some(intent.id()) {
@@ -778,7 +945,7 @@ impl MultiPortfolio {
             else { None };
         if let Some(reason) = rejection {
             Self::reject_owner(&mut owner, intent.id(), at)?;
-            return Ok(Some(reason));
+            return Ok(Some(RejectedAdmission::simple(reason, intent, at, None)));
         }
         if self.owners.contains_key(&intent.id()) {
             return Err(PortfolioError::Invariant("intent identifier already has an owner").into());
@@ -788,15 +955,13 @@ impl MultiPortfolio {
         }
         let Some(target) = self.state(symbol)?.nearest_target(intent, at)? else {
             Self::reject_owner(&mut owner, intent.id(), at)?;
-            return Ok(Some(MultiRejection::NoOpposingLiquidity));
+            return Ok(Some(RejectedAdmission::simple(MultiRejection::NoOpposingLiquidity, intent, at, None)));
         };
         let assessment = match self.risk.assess_trade(intent, &target, at) {
             Ok(assessment) => assessment,
             Err(error) if is_entry_rejection(&error) => {
-                let reason = if error == RiskError::PortfolioRiskLimitReached { MultiRejection::PortfolioRisk }
-                    else { MultiRejection::RiskRule };
                 Self::reject_owner(&mut owner, intent.id(), at)?;
-                return Ok(Some(reason));
+                return Ok(Some(RejectedAdmission::risk(&error, intent, &target, at)));
             }
             Err(error) => return Err(error.into()),
         };
@@ -815,10 +980,9 @@ impl MultiPortfolio {
                 Ok(None)
             }
             Err(error) if error.is_rejection() => {
-                let reason = book_rejection(&error);
                 self.risk.apply_reservation_event(intent.id(), ReservationEvent::EntryCancelled, at)?;
                 Self::reject_owner(&mut owner, intent.id(), at)?;
-                Ok(Some(reason))
+                Ok(Some(RejectedAdmission::book(&error, intent, &target, at)))
             }
             Err(error) => Err(error.into()),
         }
@@ -826,25 +990,24 @@ impl MultiPortfolio {
 
     fn submit_research_target(&mut self, symbol: &str, intent: &TradeIntent, mut owner: IntentOwner,
         candle: &Candle, events: &mut Vec<PortfolioEvent>,
-    ) -> Result<Option<MultiRejection>, MultiPortfolioError> {
+    ) -> Result<Option<RejectedAdmission>, MultiPortfolioError> {
         let at = candle.close_time();
         let state = self.state(symbol)?;
         let targets = state.research_targets(intent, at)?;
         let instrument = state.instrument.clone();
-        let mut rejection = MultiRejection::NoOpposingLiquidity;
+        let mut rejection = RejectedAdmission::simple(MultiRejection::NoOpposingLiquidity, intent, at, None);
         for target in targets {
             // A failed trial must not reserve this intent ID, leave an approval
             // tombstone, consume margin, or prevent assessing the next target.
             let mut risk = self.risk.clone();
             let assessment = match risk.assess_trade(intent, &target, at) {
                 Ok(assessment) => assessment,
-                Err(RiskError::MinimumRiskRewardNotMet { .. }) => {
-                    rejection = MultiRejection::RiskRule;
+                Err(error @ RiskError::MinimumRiskRewardNotMet { .. }) => {
+                    rejection = RejectedAdmission::risk(&error, intent, &target, at);
                     continue;
                 }
                 Err(error) if is_entry_rejection(&error) => {
-                    rejection = if error == RiskError::PortfolioRiskLimitReached { MultiRejection::PortfolioRisk }
-                        else { MultiRejection::RiskRule };
+                    rejection = RejectedAdmission::risk(&error, intent, &target, at);
                     break;
                 }
                 Err(error) => return Err(error.into()),
@@ -865,11 +1028,11 @@ impl MultiPortfolio {
                     events.extend(placed);
                     return Ok(None);
                 }
-                Err(BookError::Broker(PaperError::NetRiskReward)) => {
-                    rejection = MultiRejection::NetRiskReward;
+                Err(error @ BookError::Broker(PaperError::NetRiskReward)) => {
+                    rejection = RejectedAdmission::book(&error, intent, &target, at);
                 }
                 Err(error) if error.is_rejection() => {
-                    rejection = book_rejection(&error);
+                    rejection = RejectedAdmission::book(&error, intent, &target, at);
                     break;
                 }
                 Err(error) => return Err(error.into()),
@@ -1093,6 +1256,10 @@ mod tests {
         assert_eq!(baseline.analysis[0].intents, 1);
         assert_eq!(candidate.analysis[0].intents, 1);
         assert_eq!(candidate.analysis[0].rejected, 0);
+        // Failed near targets are trials, not rejected intents, when a farther
+        // target succeeds. Do not misreport them in live diagnostics.
+        assert!(viable.diagnostics()[0].live.admission_failures.is_empty());
+        assert!(viable.diagnostics()[0].live.last_admission_failure.is_none());
         let [order] = candidate.snapshot.account.orders.as_slice() else { return Err("expected one research entry".into()); };
         assert_eq!(order.order.take_profit_price, Decimal::from(150));
         assert_eq!(order.state, BookOrderState::Pending);
@@ -1123,6 +1290,103 @@ mod tests {
         assert_eq!(viable.owners.len(), 1);
         assert_eq!(viable.risk.active_reserved_risk()?, order.reserved_risk);
         assert!(order.reserved_risk <= Decimal::ONE);
+        assert!(viable.diagnostics()[0].live.admission_failures.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn admission_diagnostics_distinguish_exact_gross_rr_from_fee_adjusted_rejection() -> TestResult {
+        let mut gross = research_portfolio(PaperTargetPolicy::Nearest,
+            PaperConfig::default().with_leverage(10)?)?;
+        let prices = two_targets(120, 150);
+        let step = run_target_setup(&mut gross, &prices)?;
+        assert_eq!(step.analysis[0].rejection_reasons, [MultiRejection::RiskRule]);
+        let live = gross.diagnostics()[0].live.clone();
+        assert_eq!(live.admission_failures, [DiagnosticCount { reason: AdmissionFailureKind::GrossRiskReward, count: 1 }]);
+        let failure = live.last_admission_failure.ok_or("missing gross RR diagnostic")?;
+        assert_eq!(failure.at, at(25)?);
+        assert_eq!(failure.target_price, Some(Decimal::from(120)));
+        // The real default detector forms CE=104 and the risk manager rounds
+        // the stop one 0.1 tick below the sweep's 89 extreme.
+        assert_eq!(failure.actual_gross_rr, Decimal::from(16).checked_div(Decimal::new(151, 1)));
+        assert_eq!(failure.required_gross_rr, Some(Decimal::TWO));
+        assert!(failure.calculated_quantity.is_none() && failure.minimum_quantity.is_none());
+        assert_eq!(step.snapshot.account.balance, Decimal::from(100));
+        assert_eq!(gross.risk.active_reserved_risk()?, Decimal::ZERO);
+        assert!(step.snapshot.account.orders.is_empty());
+        // A replayed input neither increments counts nor replaces the last failure.
+        gross.process_batch(&batch(24, prices[24], NEUTRAL)?)?;
+        assert_eq!(gross.diagnostics()[0].live, live);
+        let encoded = serde_json::to_value(step)?;
+        assert_eq!(encoded["analysis"][0]["rejection_reasons"], serde_json::json!(["risk_rule"]));
+        assert!(encoded["analysis"][0].get("admission_failures").is_none());
+
+        let fees = PaperConfig::new(Decimal::from(100), Decimal::new(2, 3), Decimal::TWO,
+            Decimal::ONE, Decimal::TWO)?.with_leverage(10)?;
+        let mut net = research_portfolio(PaperTargetPolicy::Nearest, fees)?;
+        let step = run_target_setup(&mut net, &two_targets(135, 150))?;
+        assert_eq!(step.analysis[0].rejection_reasons, [MultiRejection::NetRiskReward]);
+        let live = net.diagnostics()[0].live.clone();
+        assert_eq!(live.admission_failures, [DiagnosticCount { reason: AdmissionFailureKind::NetRiskReward, count: 1 }]);
+        let failure = live.last_admission_failure.ok_or("missing net RR diagnostic")?;
+        assert_eq!(failure.target_price, Some(Decimal::from(135)));
+        assert!(failure.actual_gross_rr.is_none() && failure.required_gross_rr.is_none());
+        assert_eq!(net.risk.active_reserved_risk()?, Decimal::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_diagnostics_report_actual_risk_sized_minimum_quantity() -> TestResult {
+        let mut btc = metadata("BTCUSDT")?;
+        btc.spec = InstrumentRiskSpec::new(instrument("BTCUSDT")?, Decimal::new(1, 1),
+            Decimal::ONE, Decimal::ONE, Some(Decimal::from(100)), Decimal::ONE)?;
+        let mut engine = MultiPortfolio::new_with_entry_window(vec![btc, metadata("ETHUSDT")?],
+            PaperConfig::default().with_leverage(10)?, Timeframe::M1, PaperEntryWindow::Always)?;
+        let step = run_target_setup(&mut engine, &setup(150))?;
+        assert_eq!(step.analysis[0].rejection_reasons, [MultiRejection::RiskRule]);
+        let failure = engine.diagnostics()[0].live.last_admission_failure.ok_or("missing quantity diagnostic")?;
+        assert_eq!(failure.kind, AdmissionFailureKind::QuantityBelowMinimum);
+        assert_eq!(failure.calculated_quantity, Some(Decimal::ZERO));
+        assert_eq!(failure.minimum_quantity, Some(Decimal::ONE));
+        assert!(failure.actual_gross_rr.is_none() && failure.required_gross_rr.is_none());
+        assert_eq!(step.snapshot.account.available_cash, Decimal::from(100));
+        assert_eq!(engine.risk.active_reserved_risk()?, Decimal::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn research_admission_diagnostics_count_only_the_terminal_failed_target() -> TestResult {
+        let mut engine = research_portfolio(PaperTargetPolicy::NearestViable,
+            PaperConfig::default().with_leverage(10)?)?;
+        run_target_setup(&mut engine, &two_targets(120, 125))?;
+        let live = engine.diagnostics()[0].live.clone();
+        assert_eq!((live.intents, live.rejected), (1, 1));
+        assert_eq!(live.admission_failures, [DiagnosticCount { reason: AdmissionFailureKind::GrossRiskReward, count: 1 }]);
+        let failure = live.last_admission_failure.ok_or("missing terminal target failure")?;
+        assert_eq!(failure.target_price, Some(Decimal::from(125)));
+        assert_eq!(failure.actual_gross_rr, Decimal::from(21).checked_div(Decimal::new(151, 1)));
+        assert_eq!(failure.required_gross_rr, Some(Decimal::TWO));
+        assert_eq!(engine.risk.active_reserved_risk()?, Decimal::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_joint_batch_does_not_publish_an_earlier_symbol_admission_failure() -> TestResult {
+        let mut engine = research_portfolio(PaperTargetPolicy::Nearest,
+            PaperConfig::default().with_leverage(10)?)?;
+        let prices = two_targets(120, 150);
+        for (index, row) in prices.iter().take(24).enumerate() {
+            engine.process_batch(&batch(i64::try_from(index)?, *row, NEUTRAL)?)?;
+        }
+        let before: Vec<_> = engine.diagnostics().into_iter().map(|row| row.live).collect();
+        assert!(before[0].last_admission_failure.is_none());
+        // BTC will genuinely reject a completed setup before ETH detects this
+        // internal duplicate. No observer from the unsuccessful batch commits.
+        engine.state_mut("ETHUSDT")?.ict.process_candle(&candle("ETHUSDT", 24, NEUTRAL)?)?;
+        assert!(engine.process_batch(&batch(24, prices[24], NEUTRAL)?).is_err());
+        assert!(engine.is_poisoned());
+        let after: Vec<_> = engine.diagnostics().into_iter().map(|row| row.live).collect();
+        assert_eq!(before, after);
         Ok(())
     }
 
@@ -1577,7 +1841,7 @@ mod tests {
         let mut events = Vec::new();
         let reason = engine.submit_intent("BTCUSDT", &intent, owner,
             &candle("BTCUSDT", 24, [110, 112, 103, 109])?, false, &mut events)?;
-        assert_eq!(reason, Some(MultiRejection::DuplicateSetup));
+        assert_eq!(reason.map(|rejected| rejected.reason), Some(MultiRejection::DuplicateSetup));
         assert!(events.is_empty());
         assert_eq!(engine.snapshot(), before);
         assert_eq!(engine.risk.active_reserved_risk()?, risk);

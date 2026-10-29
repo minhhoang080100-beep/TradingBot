@@ -22,6 +22,32 @@ use crate::{
 
 const MAX_ACCEPTED_INTENTS: usize = 100_000;
 
+/// Fixed OHLC entry-timing hypotheses for offline sensitivity comparisons.
+///
+/// This is not an observed receipt/admission timestamp. In particular, a fixed
+/// bar delay does not reconstruct network outages or make catch-up fills real.
+/// Existing live constructors and V1-V4 replay keep [`Self::ImmediateNextBar`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperFillTiming {
+    /// A resting entry may fill in the bar opening at its approval timestamp.
+    #[default]
+    ImmediateNextBar,
+    /// Excludes that entire bar; expiry and protective exits are unchanged.
+    SkipFirstEligibleBar,
+}
+
+impl PaperFillTiming {
+    /// Stable report label for this research assumption.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ImmediateNextBar => "immediate_next_bar",
+            Self::SkipFirstEligibleBar => "skip_first_eligible_bar",
+        }
+    }
+}
+
 /// Validated simulation assumptions, independent from actual venue fee tiers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct PaperConfig {
@@ -378,6 +404,7 @@ impl PaperOrder {
 #[derive(Clone, Debug)]
 pub struct PaperBroker {
     config: PaperConfig,
+    fill_timing: PaperFillTiming,
     spec: InstrumentRiskSpec,
     min_notional: Decimal,
     pending: Option<PaperOrder>,
@@ -393,13 +420,14 @@ impl PaperBroker {
     /// Funds a one-shot v3 execution sleeve from an already account-capped budget.
     /// The returned allocation, not the sizing budget, is its actual cash seed.
     /// Existing v1/v2 construction, sizing and serialized accounting are unchanged.
-    pub(crate) fn allocate_order(
+    pub(crate) fn allocate_order_with_timing(
         config: PaperConfig,
         spec: InstrumentRiskSpec,
         min_notional: Decimal,
         plan: RiskPlan,
         signal_candle: &Candle,
         cash_budget: Decimal,
+        fill_timing: PaperFillTiming,
     ) -> Result<(Self, Decimal), PaperError> {
         if cash_budget <= Decimal::ZERO {
             return Err(PaperError::InsufficientBalance);
@@ -408,7 +436,7 @@ impl PaperBroker {
             cash_budget, config.fee_rate, config.stop_slippage_bps,
             Decimal::ONE, config.min_net_rr,
         )?.with_leverage(config.leverage)?;
-        let mut sleeve = Self::new(sizing_config, spec, min_notional)?;
+        let mut sleeve = Self::new_for_research(sizing_config, spec, min_notional, fill_timing)?;
         sleeve.select_instrument(sleeve.spec.clone(), min_notional, signal_candle)?;
         sleeve.submit(plan)?;
         let mut order = sleeve.pending.take().ok_or(PaperError::Arithmetic)?;
@@ -491,6 +519,24 @@ impl PaperBroker {
         spec: InstrumentRiskSpec,
         min_notional: Decimal,
     ) -> Result<Self, PaperError> {
+        Self::new_for_research(config, spec, min_notional, PaperFillTiming::ImmediateNextBar)
+    }
+
+    /// Creates an offline broker with an explicit fixed entry-timing hypothesis.
+    ///
+    /// The policy is separate from financial configuration: legacy config and
+    /// snapshots keep their exact serialization. A research report must record
+    /// this policy explicitly; existing journal formats do not encode it.
+    /// This changes eligible entry bars only, not expiry, fees, sizing or exits.
+    ///
+    /// # Errors
+    /// Returns [`PaperError::InvalidConfig`] for a negative minimum notional.
+    pub fn new_for_research(
+        config: PaperConfig,
+        spec: InstrumentRiskSpec,
+        min_notional: Decimal,
+        fill_timing: PaperFillTiming,
+    ) -> Result<Self, PaperError> {
         if min_notional < Decimal::ZERO {
             return Err(PaperError::InvalidConfig(
                 "minimum notional cannot be negative",
@@ -498,6 +544,7 @@ impl PaperBroker {
         }
         Ok(Self {
             config,
+            fill_timing,
             spec,
             min_notional,
             pending: None,
@@ -525,6 +572,10 @@ impl PaperBroker {
     pub const fn config(&self) -> &PaperConfig {
         &self.config
     }
+
+    /// Fixed entry-timing hypothesis; default constructors preserve legacy fills.
+    #[must_use]
+    pub const fn fill_timing(&self) -> PaperFillTiming { self.fill_timing }
 
     /// Instrument constraints used for sizing and adverse tick rounding.
     #[must_use]
@@ -931,7 +982,7 @@ impl PaperBroker {
                     reason: PaperCancelReason::Expired,
                 });
                 self.pending = None;
-            } else if candle.open_time() >= order.plan.approved_at() && crosses_entry(order, candle)
+            } else if self.entry_eligible(order, candle)? && crosses_entry(order, candle)
             {
                 let order = self.pending.take().ok_or(PaperError::Arithmetic)?;
                 self.metrics.balance = sub(self.metrics.balance, order.entry_fee)?;
@@ -952,6 +1003,15 @@ impl PaperBroker {
             }
         }
         Ok(events)
+    }
+
+    fn entry_eligible(&self, order: &PaperOrder, candle: &Candle) -> Result<bool, PaperError> {
+        let eligible_at = match self.fill_timing {
+            PaperFillTiming::ImmediateNextBar => order.plan.approved_at(),
+            PaperFillTiming::SkipFirstEligibleBar => order.plan.approved_at()
+                .checked_add_signed(candle.timeframe().duration()).ok_or(PaperError::Arithmetic)?,
+        };
+        Ok(candle.open_time() >= eligible_at)
     }
 
     fn exit_price(
@@ -1276,6 +1336,71 @@ pub(crate) mod tests {
             spec()?,
             Decimal::new(5, 0),
         )?)
+    }
+
+    #[test]
+    fn research_delay_excludes_first_bar_and_preserves_protective_exits() -> TestResult {
+        for direction in [Direction::Bullish, Direction::Bearish] {
+            let mut delayed = PaperBroker::new_for_research(PaperConfig::default(), spec()?,
+                Decimal::from(5), PaperFillTiming::SkipFirstEligibleBar)?;
+            delayed.submit(approval(direction)?)?;
+            let before = delayed.snapshot();
+            let crossing = |start| if direction == Direction::Bullish {
+                candle(start, 103, 115, 101, 114)
+            } else { candle(start, 97, 99, 87, 88) };
+            assert!(delayed.advance(&crossing(300)?)?.is_empty());
+            assert_eq!(delayed.snapshot(), before);
+            // Exact duplicates cannot move the embargo or charge entry fees.
+            assert!(delayed.advance(&crossing(300)?)?.is_empty());
+            assert_eq!(delayed.snapshot().fees_paid, Decimal::ZERO);
+            let entry = delayed.advance(&crossing(360)?)?;
+            assert!(matches!(entry.as_slice(), [PaperEvent::EntryFilled { at: observed, .. }] if *observed == at(420)?));
+            assert!(delayed.has_position());
+            // A target crossed on the eventual fill bar still cannot produce
+            // a same-bar win. Once open, a both-hit bar still executes the SL.
+            let both = if direction == Direction::Bullish {
+                candle(420, 103, 115, 97, 110)?
+            } else { candle(420, 97, 103, 87, 90)? };
+            let exit = delayed.advance(&both)?;
+            assert!(matches!(exit.as_slice(), [PaperEvent::PositionClosed { reason: PaperExitReason::StopLoss, .. }]));
+            assert!(delayed.is_flat());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn research_delay_does_not_extend_expiry_or_charge_unfilled_fees() -> TestResult {
+        let mut default = broker()?;
+        let mut delayed = PaperBroker::new_for_research(PaperConfig::default(), spec()?,
+            Decimal::from(5), PaperFillTiming::SkipFirstEligibleBar)?;
+        for candidate in [&mut default, &mut delayed] {
+            let plan = approval(Direction::Bullish)?;
+            assert_eq!(plan.expires_at(), at(600)?);
+            candidate.submit(plan)?;
+            // Crossing at expiry always cancels before considering a fill.
+            let events = candidate.advance(&candle(600, 103, 104, 101, 103)?)?;
+            assert!(matches!(events.as_slice(), [PaperEvent::EntryCancelled { reason: PaperCancelReason::Expired, .. }]));
+            assert!(candidate.is_flat());
+            assert_eq!(candidate.snapshot().fees_paid, Decimal::ZERO);
+        }
+        assert_eq!(default.snapshot(), delayed.snapshot());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_legacy_timing_preserves_default_serialized_outcomes() -> TestResult {
+        let mut ordinary = broker()?;
+        let mut explicit = PaperBroker::new_for_research(PaperConfig::default(), spec()?,
+            Decimal::from(5), PaperFillTiming::ImmediateNextBar)?;
+        assert_eq!(ordinary.fill_timing(), PaperFillTiming::ImmediateNextBar);
+        assert_eq!(serde_json::to_vec(ordinary.config())?, serde_json::to_vec(explicit.config())?);
+        for candidate in [&mut ordinary, &mut explicit] { candidate.submit(approval(Direction::Bullish)?)?; }
+        for bar in [candle(300, 103, 115, 101, 114)?, candle(360, 116, 117, 113, 115)?] {
+            assert_eq!(serde_json::to_vec(&ordinary.advance(&bar)?)?, serde_json::to_vec(&explicit.advance(&bar)?)?);
+            assert_eq!(serde_json::to_vec(&ordinary.snapshot())?, serde_json::to_vec(&explicit.snapshot())?);
+        }
+        assert_eq!(ordinary.snapshot().completed_trades, 1);
+        Ok(())
     }
 
     fn candle(
