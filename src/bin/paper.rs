@@ -25,7 +25,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use ict_trading_bot::{
     models::{Candle, Timeframe},
-    paper::{PaperConfig, PaperEngine, PaperSnapshot, PublicPaperMarket},
+    paper::{PaperConfig, PaperEngine, PaperEntryWindow, PaperSnapshot, PublicPaperMarket},
 };
 use rust_decimal::Decimal;
 use session::{BoxError, Header, SessionLog};
@@ -38,13 +38,17 @@ paper live [--symbol ETHUSDT] [--balance 100] [--seconds N]
            [--stop-slippage-bps 2] [--output paper-runs/NAME.jsonl]
 paper replay --input paper-runs/NAME.jsonl [--output paper-runs/REPLAY.jsonl]
 paper portfolio [--symbols BTCUSDT,ETHUSDT] [--leverage 10] [--balance 100]
+                [--entry-window always|killzones]
                 [--seconds N] [--poll-seconds 5] [--warmup 500]
                 [--fee-bps 6] [--stop-slippage-bps 2] [--heartbeat-seconds 1800]
                 [--output paper-runs/NAME.jsonl]
 
 Both modes use public Bybit USDT perpetual M1 data; no exchange credentials.
 Legacy live is single-symbol 1x, entry notional+fee <= cash.
-Portfolio v3 shares ONE account across BTC/ETH; max 4 active, max 2 per symbol.
+Portfolio v4 shares ONE account across BTC/ETH; max 4 active, max 2 per symbol.
+New portfolio sessions default to entry-window always (24/7, including weekends).
+Use --entry-window killzones for weekday New York session filtering.
+Only the time gate changes; a complete ICT setup and risk approval are required.
 Pending entries and open positions both occupy slots; no opposite-side hedging.
 Combined planned risk <= 3% at admission; each trade <= 1% (not 4 full-risk trades).
 Portfolio leverage changes initial margin only, not the risk budget or PnL.
@@ -80,6 +84,7 @@ struct PortfolioOptions {
     warmup: u16,
     output: PathBuf,
     heartbeat_seconds: u64,
+    entry_window: PaperEntryWindow,
 }
 
 #[derive(Debug)]
@@ -197,9 +202,14 @@ fn parse_args(mut args: VecDeque<String>) -> Result<Command, BoxError> {
         }
         if mode == "portfolio" {
             let (symbols, leverage, heartbeat_seconds) = portfolio_parameters(&mut flags)?;
+            let entry_window = match flags.remove("--entry-window").as_deref().unwrap_or("always") {
+                "always" => PaperEntryWindow::Always,
+                "killzones" => PaperEntryWindow::Killzones,
+                _ => return Err("--entry-window must be always or killzones".into()),
+            };
             Command::Portfolio(PortfolioOptions {
                 symbols, config: config.with_leverage(leverage)?, seconds,
-                poll_seconds, warmup, output, heartbeat_seconds,
+                poll_seconds, warmup, output, heartbeat_seconds, entry_window,
             })
         } else { Command::Live(LiveOptions {
             symbol,
@@ -555,6 +565,11 @@ mod tests {
             vec!["live", "--leverage", "10"],
             vec!["portfolio", "--telegram-token", "not-a-real-token"],
             vec!["portfolio", "--heartbeat-seconds", "1"],
+            vec!["portfolio", "--entry-window", "24h"],
+            vec!["portfolio", "--entry-window", "Always"],
+            vec!["portfolio", "--entry-window", "always", "--entry-window", "killzones"],
+            vec!["live", "--entry-window", "always"],
+            vec!["replay", "--input", "x", "--entry-window", "always"],
         ] {
             assert!(command(&args).is_err());
         }
@@ -567,6 +582,21 @@ mod tests {
         assert_eq!(options.config.initial_balance(), Decimal::new(100, 0));
         assert_eq!(options.config.leverage(), 10);
         assert_eq!(options.heartbeat_seconds, 1800);
+        assert_eq!(options.entry_window, PaperEntryWindow::Always);
+        Ok(())
+    }
+
+    #[test]
+    fn portfolio_entry_window_is_explicit_and_does_not_change_risk_or_leverage() -> Result<(), BoxError> {
+        for (value, expected) in [("always", PaperEntryWindow::Always), ("killzones", PaperEntryWindow::Killzones)] {
+            let Command::Portfolio(options) = command(&["portfolio", "--entry-window", value])? else {
+                return Err("wrong command".into());
+            };
+            assert_eq!(options.entry_window, expected);
+            assert_eq!(options.config.initial_balance(), Decimal::new(100, 0));
+            assert_eq!(options.config.leverage(), 10);
+            assert_eq!(options.config.min_net_rr(), Decimal::TWO);
+        }
         Ok(())
     }
 

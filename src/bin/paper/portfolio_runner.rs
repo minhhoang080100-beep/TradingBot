@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use futures_util::future::try_join_all;
 use ict_trading_bot::{
     ict_engine::{Killzone, KillzoneFilter},
-    paper::{BookOrderState, PaperConfig, PaperEvent, PaperInstrument, PaperMarketError, PaperOrderSnapshot, MultiPortfolio as PaperPortfolio, PortfolioEvent, MultiPortfolioSnapshot as PortfolioSnapshot, PublicPaperMarket},
+    paper::{BookOrderState, PaperConfig, PaperEntryWindow, PaperEvent, PaperInstrument, PaperMarketError, PaperOrderSnapshot, MultiPortfolio as PaperPortfolio, PortfolioEvent, MultiPortfolioSnapshot as PortfolioSnapshot, PublicPaperMarket},
     telegram::{TelegramConfig, TelegramNotifier},
     Candle, Direction, Timeframe,
 };
@@ -74,7 +74,7 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
     let last_batch = batches.last().ok_or("missing portfolio warmup batch")?;
     for candle in last_batch { check_freshness(candle)?; }
     let mut cursor = last_batch.first().ok_or("empty portfolio warmup batch")?.close_time();
-    let header = PortfolioHeader::new(&instruments, options.config, session);
+    let header = PortfolioHeader::new_with_entry_window(&instruments, options.config, session, options.entry_window);
     let mut engine = header.engine()?;
     let mut log = tokio::task::block_in_place(|| PortfolioLog::create(&options.output, &header))?;
     let mut recent = VecDeque::new();
@@ -98,11 +98,11 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
     }
     // Startup retries are resolved only after the complete warmup is journaled.
     recovery_state.committed(notifier, session, cursor);
-    println!("PAPER PORTFOLIO V3 | max_active=4 | max_per_symbol=2 | total_risk_cap=3% | symbols={} | initial={} USDT | leverage={}x | warmup={} each | candle_delay=10s | session={} | log={}",
-        options.symbols.join(","), options.config.initial_balance(), options.config.leverage(), options.warmup, session, options.output.display());
+    println!("PAPER PORTFOLIO V4 | max_active=4 | max_per_symbol=2 | total_risk_cap=3% | symbols={} | initial={} USDT | leverage={}x | entry_window={} | warmup={} each | candle_delay=10s | session={} | log={}",
+        options.symbols.join(","), options.config.initial_balance(), options.config.leverage(), options.entry_window.as_str(), options.warmup, session, options.output.display());
     println!("{}", serde_json::to_string(&engine.snapshot())?);
-    notify(notifier, format!("[PAPER V3] STARTED\nSession: {session}\nSymbols: {} / M1\nShared balance: {} USDT\nLeverage: {}x (initial-margin simulation only)\nRisk: <=1% per trade, <=3% combined at admission; daily breaker: 5%; net RR >= 2\nMax 4 active (pending + open), max 2 per symbol. Each setup has its own Entry/TP/SL. No opposite-side hedging on the same symbol.\nSlots do not guarantee available risk or margin.\nFunding/venue liquidation not modeled. Restart does not resume.\nLast closed candle: {cursor}",
-        options.symbols.join(", "), options.config.initial_balance(), options.config.leverage()));
+    notify(notifier, format!("[PAPER V4] STARTED\nSession: {session}\nSymbols: {} / M1\nShared balance: {} USDT\nLeverage: {}x (initial-margin simulation only)\nEntry schedule: {}\nComplete sweep/MSS/FVG/retracement setup is still required.\nRisk: <=1% per trade, <=3% combined at admission; daily breaker: 5%; net RR >= 2\nMax 4 active (pending + open), max 2 per symbol. Each setup has its own Entry/TP/SL. No opposite-side hedging on the same symbol.\nSlots do not guarantee available risk or margin.\nFunding/venue liquidation not modeled. Restart does not resume.\nLast closed candle: {cursor}",
+        options.symbols.join(", "), options.config.initial_balance(), options.config.leverage(), entry_schedule(options.entry_window)));
     let outcome = collect(&market, &instruments, options, &mut engine, &mut log, &mut recent, &mut cursor,
         notifier, session, shutdown, &mut recovery_state).await;
     let reason = outcome.as_ref().map_or("error", |reason| *reason);
@@ -158,7 +158,7 @@ async fn collect(
             () = tokio::time::sleep_until(stale_at) => return Err("synchronized portfolio feed is stale; recovery stopped".into()),
             _ = heartbeat.tick() => {
                 ensure_joint_feed_current(*cursor, stale_at)?;
-                let message = format!("{}\n{}", heartbeat_message(session, *cursor, &engine.snapshot(), recovery_state), diagnostics_message(engine));
+                let message = format!("{}\n{}", heartbeat_message(session, *cursor, &engine.snapshot(), recovery_state, engine.entry_window()), diagnostics_message(engine));
                 notify(notifier, message);
                 continue;
             }
@@ -380,22 +380,30 @@ fn status_message(session: Uuid, reason: &str, last_close: Option<DateTime<Utc>>
 }
 
 fn heartbeat_message(session: Uuid, cursor: DateTime<Utc>, snapshot: &PortfolioSnapshot,
-    recovery: &FeedRecovery) -> String {
+    recovery: &FeedRecovery, entry_window: PaperEntryWindow) -> String {
     let window = KillzoneFilter::default().classify(cursor);
-    let window_name = match window {
-        Some(Killzone::London) => "OPEN (London)",
-        Some(Killzone::NewYork) => "OPEN (New York)",
-        None => "CLOSED (outside configured entry hours)",
+    let window_name = match (entry_window, window) {
+        (PaperEntryWindow::Always, _) => "OPEN (24/7, including weekends)",
+        (_, Some(Killzone::London)) => "OPEN (London)",
+        (_, Some(Killzone::NewYork)) => "OPEN (New York)",
+        (_, None) => "CLOSED (outside configured entry hours)",
     };
     let feed = if recovery.outage_announced { "RETRYING / awaiting validated batch" }
         else { "CURRENT (last processed batch validated)" };
     let gate = if snapshot.halted { "PAUSED: risk/session halt" }
         else if recovery.outage_announced { "PAUSED: public data recovery" }
-        else if window.is_none() { "PAUSED: outside entry window" }
+        else if !entry_window.allows(cursor) { "PAUSED: outside entry window" }
         else { "OPEN: still requires a valid setup, free slots and risk/margin approval" };
-    format!("{}\n\nFeed: {feed}\nFeed retries/recoveries this session: {}/{}\nEntry window at last candle: {window_name}\nNew entry timing/data gate: {gate}\nLast candle (Vietnam): {}\nSchedule: weekdays 02:00-05:00 / 07:00-10:00 America/New_York (DST-aware). Existing paper orders continue to be simulated outside entry windows.",
+    format!("{}\n\nFeed: {feed}\nFeed retries/recoveries this session: {}/{}\nEntry window at last candle: {window_name}\nNew entry timing/data gate: {gate}\nLast candle (Vietnam): {}\nSchedule: {}. Existing paper orders continue to be simulated outside entry windows.",
         status_message(session, "HEARTBEAT", Some(cursor), snapshot), recovery.total_retries,
-        recovery.recoveries, cursor.with_timezone(&chrono_tz::Asia::Ho_Chi_Minh).format("%Y-%m-%d %H:%M:%S %Z"))
+        recovery.recoveries, cursor.with_timezone(&chrono_tz::Asia::Ho_Chi_Minh).format("%Y-%m-%d %H:%M:%S %Z"), entry_schedule(entry_window))
+}
+
+fn entry_schedule(entry_window: PaperEntryWindow) -> &'static str {
+    match entry_window {
+        PaperEntryWindow::Always => "24/7 (every day, including weekends)",
+        PaperEntryWindow::Killzones => "weekdays 02:00-05:00 / 07:00-10:00 America/New_York (DST-aware)",
+    }
 }
 
 fn diagnostics_message(engine: &PaperPortfolio) -> String {
@@ -646,7 +654,7 @@ mod notification_tests {
             snapshot.account.orders.push(active);
         }
         let recovery = FeedRecovery { total_retries: u64::MAX, recoveries: u64::MAX, ..FeedRecovery::default() };
-        let mut message = heartbeat_message(Uuid::from_u128(7), at(420)?, &snapshot, &recovery);
+        let mut message = heartbeat_message(Uuid::from_u128(7), at(420)?, &snapshot, &recovery, PaperEntryWindow::Killzones);
         // Reserve ample space for the bounded two-symbol diagnostics suffix.
         message.push_str(&"x".repeat(512));
         assert!(message.contains("Active (pending + open): 4/4; BTC 2/2; ETH 2/2"));
@@ -743,6 +751,7 @@ mod notification_tests {
             warmup: 50,
             output: output.clone(),
             heartbeat_seconds: 1800,
+            entry_window: PaperEntryWindow::Always,
         };
         let mut shutdown = std::future::ready(Ok(()));
         // Biased shutdown wins before the public-data future is ever polled.
@@ -894,21 +903,21 @@ mod notification_tests {
         let inside = DateTime::parse_from_rfc3339("2026-10-29T06:30:00Z")?.with_timezone(&Utc);
         let mut snapshot = snapshot();
         let mut recovery = FeedRecovery::default();
-        let message = heartbeat_message(Uuid::nil(), outside, &snapshot, &recovery);
+        let message = heartbeat_message(Uuid::nil(), outside, &snapshot, &recovery, PaperEntryWindow::Killzones);
         assert!(message.contains("Risk/session halt: false"));
         assert!(message.contains("Entry window at last candle: CLOSED"));
         assert!(message.contains("PAUSED: outside entry window"));
         assert!(message.contains("2026-10-29 07:35:00"));
         assert!(!message.contains("Entries blocked: false"));
         recovery.outage_announced = true;
-        let message = heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery);
+        let message = heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones);
         assert!(message.contains("RETRYING / awaiting validated batch"));
         assert!(message.contains("PAUSED: public data recovery"));
         recovery.outage_announced = false;
         snapshot.halted = true;
-        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery).contains("PAUSED: risk/session halt"));
+        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones).contains("PAUSED: risk/session halt"));
         snapshot.halted = false;
-        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery).contains("OPEN: still requires a valid setup"));
+        assert!(heartbeat_message(Uuid::nil(), inside, &snapshot, &recovery, PaperEntryWindow::Killzones).contains("OPEN: still requires a valid setup"));
         Ok(())
     }
 
@@ -924,8 +933,30 @@ mod notification_tests {
             ("2026-10-31T06:30:00Z", "CLOSED"),
         ] {
             let at = DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc);
-            let message = heartbeat_message(Uuid::nil(), at, &snapshot(), &FeedRecovery::default());
+            let message = heartbeat_message(Uuid::nil(), at, &snapshot(), &FeedRecovery::default(), PaperEntryWindow::Killzones);
             assert!(message.contains(&format!("Entry window at last candle: {expected}")), "{timestamp}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn always_entry_heartbeat_opens_nights_and_weekends_but_preserves_safety_gates() -> Result<(), BoxError> {
+        for timestamp in ["2026-10-29T01:00:00Z", "2026-10-31T08:00:00Z", "2026-11-01T08:00:00Z"] {
+            let at = DateTime::parse_from_rfc3339(timestamp)?.with_timezone(&Utc);
+            let mut snapshot = snapshot();
+            let mut recovery = FeedRecovery::default();
+            let message = heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always);
+            assert!(message.contains("Entry window at last candle: OPEN (24/7, including weekends)"));
+            assert!(message.contains("OPEN: still requires a valid setup"));
+            assert!(!message.contains("PAUSED: outside entry window"));
+            assert!(message.contains("Schedule: 24/7"));
+            snapshot.halted = true;
+            assert!(heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always)
+                .contains("PAUSED: risk/session halt"));
+            snapshot.halted = false;
+            recovery.outage_announced = true;
+            assert!(heartbeat_message(Uuid::nil(), at, &snapshot, &recovery, PaperEntryWindow::Always)
+                .contains("PAUSED: public data recovery"));
         }
         Ok(())
     }

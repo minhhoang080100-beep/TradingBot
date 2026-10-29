@@ -9,16 +9,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     candle_store::CandleKey,
-    ict_engine::{IctDetectionBatch, IctEngine, IctEngineConfig, IctEngineEvent},
+    ict_engine::{IctDetectionBatch, IctEngine, IctEngineConfig, IctEngineEvent, KillzoneFilter},
     models::{Candle, Direction, Exchange, LiquiditySide, MarketKind, SwingKind, SwingPoint,
         Timeframe, TradeIntent, VolumeUnit},
     risk::{LiquidityTarget, ReservationEvent, RiskConfig, RiskError, RiskManager, TradeAssessment},
-    strategy::{SetupDiscardReason, StrategyAction, StrategyCommand, StrategyConfig, StrategyEngine, StrategyStage},
+    strategy::{KillzonePolicy, SetupDiscardReason, StrategyAction, StrategyCommand, StrategyConfig, StrategyEngine, StrategyStage},
 };
 
 use super::{
@@ -30,6 +30,42 @@ use super::{
 
 const MAX_RETAINED_BATCHES: usize = 100_000;
 const MAX_CONSUMED_SETUPS: usize = 100_000;
+
+/// Immutable entry-time policy for a multi-symbol paper session.
+///
+/// This controls only when a valid setup may generate an entry. It does not
+/// relax setup confirmation, risk, margin, slot limits or data validation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperEntryWindow {
+    /// Weekday London/New York windows, using DST-aware New York wall time.
+    #[default]
+    Killzones,
+    /// Every hour and every day, including crypto weekends.
+    Always,
+}
+
+impl PaperEntryWindow {
+    /// Stable CLI and journal value for this policy.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self { Self::Killzones => "killzones", Self::Always => "always" }
+    }
+
+    /// Whether a candle close passes this entry-time policy.
+    #[must_use]
+    pub fn allows(self, at: DateTime<Utc>) -> bool {
+        match self { Self::Killzones => KillzoneFilter::default().allows(at), Self::Always => true }
+    }
+
+    fn strategy_config(self) -> StrategyConfig {
+        let defaults = StrategyConfig::default();
+        StrategyConfig::new(defaults.entry_mode(), defaults.time_to_live_bars(), match self {
+            Self::Killzones => KillzonePolicy::EntryOnly,
+            Self::Always => KillzonePolicy::Disabled,
+        })
+    }
+}
 
 /// The single shared V3 account and its entry-admission status.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -175,12 +211,12 @@ struct SymbolState {
 }
 
 impl SymbolState {
-    fn new(instrument: PaperInstrument, timeframe: Timeframe) -> Self {
+    fn new(instrument: PaperInstrument, timeframe: Timeframe, entry_window: PaperEntryWindow) -> Self {
         let config = IctEngineConfig::default();
         let liquidity_capacity = config.limits().swing_capacity().get();
         Self { key: CandleKey { instrument: instrument.spec.instrument().clone(), timeframe },
             instrument, ict: IctEngine::new(config),
-            discovery: StrategyEngine::new(StrategyConfig::default()),
+            discovery: StrategyEngine::new(entry_window.strategy_config()),
             liquidity: VecDeque::new(), liquidity_capacity,
             last_analyzed_close: None, last_discard: None }
     }
@@ -249,6 +285,7 @@ pub struct MultiPortfolio {
     consumed_mss: BTreeSet<(CandleKey, Uuid)>,
     consumed_fvg: BTreeSet<(CandleKey, Uuid)>,
     timeframe: Timeframe,
+    entry_window: PaperEntryWindow,
     risk: RiskManager,
     book: PaperBook,
     history: BTreeMap<DateTime<Utc>, Vec<Candle>>,
@@ -262,6 +299,19 @@ impl MultiPortfolio {
     /// # Errors
     /// Rejects unsupported/duplicate instruments, non-M1 input and bad metadata.
     pub fn new(instruments: Vec<PaperInstrument>, config: PaperConfig, timeframe: Timeframe) -> Result<Self, MultiPortfolioError> {
+        Self::new_with_entry_window(instruments, config, timeframe, PaperEntryWindow::Killzones)
+    }
+
+    /// Creates one shared account with an explicit immutable entry-time policy.
+    ///
+    /// Setup detection, owner lifecycle and every financial limit are the same
+    /// for both policies. Each subsequent discovery strategy inherits this
+    /// policy, including after an earlier setup was admitted or rejected.
+    ///
+    /// # Errors
+    /// Rejects unsupported/duplicate instruments, non-M1 input and bad metadata.
+    pub fn new_with_entry_window(instruments: Vec<PaperInstrument>, config: PaperConfig,
+        timeframe: Timeframe, entry_window: PaperEntryWindow) -> Result<Self, MultiPortfolioError> {
         if instruments.is_empty() || instruments.len() > 2 || timeframe != Timeframe::M1 {
             return Err(PortfolioError::Configuration("expected one or two M1 instruments").into());
         }
@@ -284,14 +334,18 @@ impl MultiPortfolio {
             }
             let symbol = identity.venue_symbol.as_str().to_owned();
             risk.register_instrument_spec(instrument.spec.clone())?;
-            if symbols.insert(symbol, SymbolState::new(instrument, timeframe)).is_some() {
+            if symbols.insert(symbol, SymbolState::new(instrument, timeframe, entry_window)).is_some() {
                 return Err(PortfolioError::Configuration("duplicate instrument").into());
             }
         }
         Ok(Self { symbols, owners: BTreeMap::new(), consumed_mss: BTreeSet::new(),
-            consumed_fvg: BTreeSet::new(), timeframe, risk, book: PaperBook::new(config)?,
+            consumed_fvg: BTreeSet::new(), timeframe, entry_window, risk, book: PaperBook::new(config)?,
             history: BTreeMap::new(), phase: Phase::WarmingUp, insolvent: false })
     }
+
+    /// Returns the policy retained by this session and all fresh discoveries.
+    #[must_use]
+    pub const fn entry_window(&self) -> PaperEntryWindow { self.entry_window }
 
     /// Initializes symbol contexts without creating historical orders or fills.
     ///
@@ -501,9 +555,10 @@ impl MultiPortfolio {
                     analysis.intents += 1;
                     // Move the actual pending strategy; never fake a fill/exit
                     // merely to let the symbol search for its next setup.
+                    let strategy_config = self.entry_window.strategy_config();
                     let state = self.state_mut(symbol)?;
                     let owner = IntentOwner { key: state.key.clone(), strategy: std::mem::replace(
-                        &mut state.discovery, StrategyEngine::new(StrategyConfig::default())) };
+                        &mut state.discovery, StrategyEngine::new(strategy_config)) };
                     if let Some(reason) = self.submit_intent(symbol, &intent, owner, candle, warmup, events)? {
                         analysis.reject(reason);
                     }
@@ -757,6 +812,102 @@ mod tests {
         }
         assert_eq!(engine.snapshot().account.orders.len(), 2);
         Ok(engine)
+    }
+
+    fn portfolio_with_window(entry_window: PaperEntryWindow) -> Result<MultiPortfolio, Box<dyn Error>> {
+        Ok(MultiPortfolio::new_with_entry_window(vec![metadata("ETHUSDT")?, metadata("BTCUSDT")?],
+            PaperConfig::default().with_leverage(10)?, Timeframe::M1, entry_window)?)
+    }
+
+    #[test]
+    fn always_allows_real_night_and_weekend_setups_while_legacy_does_not() -> TestResult {
+        for offset in [-360, 3 * 24 * 60] {
+            let mut legacy = portfolio()?;
+            let mut continuous = portfolio_with_window(PaperEntryWindow::Always)?;
+            assert_eq!(legacy.entry_window(), PaperEntryWindow::Killzones);
+            assert_eq!(continuous.entry_window(), PaperEntryWindow::Always);
+            for (minute, prices) in setup(150).into_iter().enumerate() {
+                let candles = batch(offset + i64::try_from(minute)?, prices, NEUTRAL)?;
+                assert!(!PaperEntryWindow::Killzones.allows(candles[0].close_time()));
+                assert!(PaperEntryWindow::Always.allows(candles[0].close_time()));
+                legacy.process_batch(&candles)?;
+                continuous.process_batch(&candles)?;
+            }
+            assert!(legacy.snapshot().account.orders.is_empty());
+            assert_eq!(legacy.diagnostics()[0].last_discard.map(|last| last.reason),
+                Some(SetupDiscardReason::EntryTouchedOutsideKillzone));
+            let account = continuous.snapshot().account;
+            assert_eq!(account.orders.len(), 1);
+            assert_eq!(account.orders[0].state, BookOrderState::Pending);
+            assert!(account.orders[0].reserved_risk <= Decimal::ONE);
+            assert!(account.reserved_risk <= Decimal::from(3));
+            assert_eq!(account.balance, Decimal::from(100));
+            assert_eq!(account.leverage, 10);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn always_survives_discovery_replacement_after_admission_and_warmup_rejection() -> TestResult {
+        for first_is_warmup in [false, true] {
+            let mut engine = portfolio_with_window(PaperEntryWindow::Always)?;
+            let offset = -360;
+            for (minute, prices) in setup(1_000).into_iter().enumerate() {
+                let candles = batch(offset + i64::try_from(minute)?, prices, NEUTRAL)?;
+                if first_is_warmup { engine.warm_up(&candles)?; }
+                else { engine.process_batch(&candles)?; }
+            }
+            assert_eq!(engine.snapshot().account.orders.len(), usize::from(!first_is_warmup));
+            engine.process_batch(&batch(offset + 25, [109, 110, 103, 109], NEUTRAL)?)?;
+            for (index, prices) in subsequent_setup(700, 50).into_iter().enumerate() {
+                let candles = batch(offset + 26 + i64::try_from(index)?, prices, NEUTRAL)?;
+                assert!(!PaperEntryWindow::Killzones.allows(candles[0].close_time()));
+                engine.process_batch(&candles)?;
+            }
+            let account = engine.snapshot().account;
+            assert_eq!(account.orders.len(), if first_is_warmup { 1 } else { 2 });
+            assert_eq!(account.orders.iter().filter(|order| order.state == BookOrderState::Pending).count(), 1);
+            assert_eq!(engine.entry_window(), PaperEntryWindow::Always);
+            assert!(account.reserved_risk <= Decimal::from(3));
+            assert!(account.orders.iter().all(|order| order.symbol == "BTCUSDT"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn policies_have_identical_execution_and_risk_during_an_enabled_window() -> TestResult {
+        let mut legacy = portfolio()?;
+        let mut continuous = portfolio_with_window(PaperEntryWindow::Always)?;
+        let mut candles = setup(1_000);
+        candles.push([109, 110, 103, 109]);
+        candles.extend(subsequent_setup(700, 50));
+        candles.push([159, 160, 153, 159]);
+        candles.extend(subsequent_setup(400, 100));
+        let mut saw_symbol_limit = false;
+        for (minute, prices) in candles.into_iter().enumerate() {
+            let candles = batch(i64::try_from(minute)?, prices, NEUTRAL)?;
+            assert!(PaperEntryWindow::Killzones.allows(candles[0].close_time()));
+            let expected = legacy.process_batch(&candles)?;
+            let actual = continuous.process_batch(&candles)?;
+            assert_eq!(serde_json::to_value(&actual)?, serde_json::to_value(&expected)?);
+            saw_symbol_limit |= actual.analysis.iter().any(|row| row.rejection_reasons.contains(&MultiRejection::SymbolSlots));
+        }
+        assert!(saw_symbol_limit);
+        assert_eq!(continuous.snapshot().account.orders.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn entry_window_serialization_is_explicit_and_rejects_unknown_values() -> TestResult {
+        for policy in [PaperEntryWindow::Killzones, PaperEntryWindow::Always] {
+            let value = serde_json::to_value(policy)?;
+            assert_eq!(value, serde_json::Value::String(policy.as_str().to_owned()));
+            assert_eq!(serde_json::from_value::<PaperEntryWindow>(value)?, policy);
+        }
+        for value in [serde_json::json!("24/7"), serde_json::json!("ALWAYS"), serde_json::json!(null), serde_json::json!(true)] {
+            assert!(serde_json::from_value::<PaperEntryWindow>(value).is_err());
+        }
+        Ok(())
     }
 
     #[test]

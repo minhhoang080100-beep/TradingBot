@@ -4,23 +4,23 @@ Thư viện Rust Edition 2021 cho chiến lược ICT trên crypto futures, có 
 
 Repository hiện có CLI **PAPER không cần API key**, các thành phần của cả năm lớp, journal/checkpoint/outbox để khôi phục trạng thái cục bộ và inventory scanner chỉ đọc cho ba sàn, nhưng **chưa phải bot chạy tiền thật hoàn chỉnh hoặc đã được xác nhận production-ready**. CLI PAPER chỉ mô phỏng; chưa có runner nối toàn bộ pipeline execution có xác thực, bộ đối soát toàn tài khoản đủ để mở quyền entry hay kết quả kiểm thử giao dịch demo/live. Khôi phục checkpoint hoặc hoàn tất một inventory scan không đồng nghĩa đã xác nhận tài khoản flat. Các kiểm thử execution dùng dữ liệu giả và máy chủ HTTP/WebSocket cục bộ; không đặt lệnh thật.
 
-## PAPER portfolio v3: tối đa 2 BTC + 2 ETH, vốn chung 100 USDT, x10
+## PAPER portfolio v4: cho phép entry 24/7, vốn chung 100 USDT, x10
 
-Chế độ mới `portfolio` dùng dữ liệu public Bybit M1, **một tài khoản giả lập 100 USDT chung**, không phải 100 USDT cho mỗi cặp. Không cần tài khoản sàn và không gửi lệnh lên sàn.
+Chế độ `portfolio` dùng dữ liệu public Bybit M1, **một tài khoản giả lập 100 USDT chung**, không phải 100 USDT cho mỗi cặp. Không cần tài khoản sàn và không gửi lệnh lên sàn. Phiên mới mặc định `--entry-window always`: được xét tạo lệnh **24 giờ mỗi ngày, cả cuối tuần**, khi đủ setup và risk; không ép phải có lệnh hoặc luôn giữ vị thế. Dùng `--entry-window killzones` để giữ bộ lọc giờ thứ Hai–thứ Sáu theo New York. Chế độ đơn cặp `live` và replay log cũ giữ hành vi trước đây.
 
 ```powershell
-cargo run --locked --release --no-default-features --bin paper -- portfolio --symbols "BTCUSDT,ETHUSDT" --leverage 10 --balance 100 --seconds 300
+cargo run --locked --release --no-default-features --bin paper -- portfolio --symbols "BTCUSDT,ETHUSDT" --leverage 10 --balance 100 --entry-window always --seconds 300
 # Hoặc wrapper; Docker fallback không chuyển tiếp biến Telegram từ host:
-.\scripts\paper.ps1 portfolio --symbols "BTCUSDT,ETHUSDT" --leverage 10 --balance 100 --seconds 300
+.\scripts\paper.ps1 portfolio --symbols "BTCUSDT,ETHUSDT" --leverage 10 --balance 100 --entry-window always --seconds 300
 ```
 
-- Chuỗi ICT giữ nguyên: liquidity sweep → displacement/MSS + FVG → limit retracement. SL ngoài extreme sweep, TP tại opposing liquidity đã xác nhận; không tạo TP/tín hiệu giả để ép giao dịch. Killzone New York có DST và lịch thứ Hai–thứ Sáu như chế độ cũ.
+- Chuỗi ICT giữ nguyên: liquidity sweep → displacement/MSS + FVG → limit retracement. SL ngoài extreme sweep, TP tại opposing liquidity đã xác nhận; không tạo TP/tín hiệu giả để ép giao dịch. Khi chọn `killzones`, giờ New York có DST và lịch thứ Hai–thứ Sáu như chế độ cũ; khi chọn `always`, chỉ bỏ điều kiện giờ/ngày, không nới các điều kiện setup khác.
 - BTC/ETH có detector riêng và vòng đời strategy riêng cho mỗi intent, nhưng **chung một sổ vốn, risk manager và daily-risk baseline**. Tối đa **4 lệnh active, tối đa 2 mỗi symbol**; pending limit cũng chiếm chỗ như vị thế đã khớp. Mỗi setup có Trade ID/Entry/TP/SL riêng; setup mới không ghi đè hay tự thêm khối lượng vào lệnh cũ. Không tự DCA/martingale và không cho LONG + SHORT cùng symbol. Khi hai cặp cùng có setup, BTC được xét trước theo thứ tự cố định.
 - Rủi ro kế hoạch tối đa **1% equity/lệnh, tổng reservation tối đa 3% equity tại lúc nhận lệnh mới**, có phí và stop slippage; net RR ≥ 2, circuit breaker drawdown ngày UTC 5%. Không chia đều mặc định thành 0,75% để ép đủ bốn lệnh: số lượng thực tế còn phụ thuộc risk còn lại, quantity step/minimum, net RR và cash. Trần risk là điều kiện admission, không phải cam kết lỗ tối đa: gap có thể làm lỗ vượt kế hoạch, equity giảm cũng có thể khiến tỷ lệ reservation đang giữ vượt 3%; bot chặn risk mới chứ không giả lập đóng cưỡng bức. Nến được đồng bộ theo thời điểm đóng của cả hai cặp trước khi cập nhật equity/risk.
 - Khi nhận limit, sổ vốn giữ trước initial margin và phí entry/exit từ **chính số tiền chung còn khả dụng**, không tạo broker con với 100 USDT độc lập. Khi hủy/đóng, phần vốn còn lại và lãi/lỗ được trả về cùng sổ vốn. Lãi chưa thực hiện không tạo thêm cash để mở lệnh.
 - x10 chỉ thay đổi khả năng ký quỹ: initial margin mô phỏng = entry notional / 10; còn dự trữ phí entry/exit. Quantity vẫn bị chặn bởi mức risk 1%, step/minimum của từng instrument và cash. PnL = chênh lệch giá × quantity, **không nhân thêm 10**; phí tính trên notional, không phải margin.
 - Đây **không phải mô phỏng đầy đủ cơ chế margin của Bybit**: chưa có funding, mark-price maintenance margin hay liquidation. Không dùng kết quả để suy ra khoảng cách thanh lý thực. [Bybit initial margin](https://www.bybit.com/en/help-center/article/Initial-Margin-USDT-Contract)
-- Warmup 500 nến mỗi cặp, poll 5 giây, **chờ thêm ít nhất 10 giây sau ranh giới đóng nến** trước khi đưa REST candle vào engine. Smoke test phát hiện close/volume vừa đóng phút còn thay đổi ở lần đọc kế tiếp; khoảng chờ giảm race này, không bảo đảm finality hay miễn trừ sai lệch đồng hồ. Thiếu/gap/sửa nến đã xử lý vẫn dừng để kiểm tra; lỗi HTTP tạm thời được thử lại có giới hạn như mục bên dưới. Log **v3** lưu giới hạn 4/2/1%/3%/5%, leverage, metadata, analysis, từng lifecycle và sổ vốn chung. `paper replay` tự nhận **v1/v2/v3**, offline, không gửi Telegram; engine cũ giữ riêng để không thay đổi kết quả log v1/v2. Replay không phải resume.
+- Warmup 500 nến mỗi cặp, poll 5 giây, **chờ thêm ít nhất 10 giây sau ranh giới đóng nến** trước khi đưa REST candle vào engine. Smoke test phát hiện close/volume vừa đóng phút còn thay đổi ở lần đọc kế tiếp; khoảng chờ giảm race này, không bảo đảm finality hay miễn trừ sai lệch đồng hồ. Thiếu/gap/sửa nến đã xử lý vẫn dừng để kiểm tra; lỗi HTTP tạm thời được thử lại có giới hạn như mục bên dưới. Log **v4** lưu rõ `entry_window` cùng giới hạn 4/2/1%/3%/5%, leverage, metadata, analysis, từng lifecycle và sổ vốn chung. `paper replay` tự nhận **v1/v2/v3/v4**, offline, không gửi Telegram; v1/v2 dùng engine cũ, v3 luôn khôi phục chế độ killzones đã dùng trước đây. Replay không phải resume.
 
 Bỏ `--seconds` để chạy liên tục. **Mỗi restart/redeploy vẫn tạo tài khoản mới**; volume chỉ giữ log, chưa resume cash/vị thế/risk. Shutdown hủy pending nhưng không ghi một giao dịch đóng vị thế giả. Không gộp các phiên mới thành một lịch sử lợi nhuận liên tục.
 
@@ -41,9 +41,9 @@ Hai runner `live` và `portfolio` thử lại **chỉ các GET dữ liệu công
 
 ### Telegram: theo dõi pending, Entry, TP, SL và PnL
 
-Telegram chỉ là kênh thông báo, không điều khiển giao dịch. Tính năng mặc định **tắt**, chỉ bật trong `paper portfolio`. Tin có nhãn `[PAPER]` (startup `[PAPER V3]`), symbol, LONG/SHORT, Entry, TP, SL, quantity, x10, margin ước tính, trade/session ID và balance/equity sau batch. Heartbeat liệt kê **từng lệnh pending/open**, số chỗ BTC/ETH, tổng risk/capital giữ chỗ và cash còn khả dụng; không gộp hai entry cùng symbol thành một giá vào lệnh. Có tin khi đặt limit **chưa khớp**, khớp giả lập, hủy, đóng TP/SL, chặn entry, khởi động/dừng và heartbeat mặc định mỗi 30 phút (`--heartbeat-seconds`, tối thiểu 60). Quan sát theo nến đóng, không phải cập nhật giá tick hay realtime fill từ sàn.
+Telegram chỉ là kênh thông báo, không điều khiển giao dịch. Tính năng mặc định **tắt**, chỉ bật trong `paper portfolio`. Tin có nhãn `[PAPER]` (startup `[PAPER V4]`), symbol, LONG/SHORT, Entry, TP, SL, quantity, x10, margin ước tính, trade/session ID và balance/equity sau batch. Heartbeat liệt kê **từng lệnh pending/open**, số chỗ BTC/ETH, tổng risk/capital giữ chỗ và cash còn khả dụng; không gộp hai entry cùng symbol thành một giá vào lệnh. Có tin khi đặt limit **chưa khớp**, khớp giả lập, hủy, đóng TP/SL, chặn entry, khởi động/dừng và heartbeat mặc định mỗi 30 phút (`--heartbeat-seconds`, tối thiểu 60). Quan sát theo nến đóng, không phải cập nhật giá tick hay realtime fill từ sàn.
 
-Heartbeat tách riêng `Risk/session halt`, trạng thái feed, tổng retry/recovery của phiên và entry window tại nến cuối đã xử lý. `Risk/session halt: false` không đồng nghĩa đang trong giờ vào lệnh. Khung giờ theo `America/New_York`, thứ Hai–thứ Sáu, có DST; kèm thời điểm nến theo Việt Nam. Với cấu hình mặc định, ngày 29/10/2026 các cửa sổ tương ứng 13:00–16:00 và 18:00–21:00 Việt Nam. Lệnh paper đang tồn tại vẫn được mô phỏng ngoài giờ tạo entry. Discovery BTC/ETH có chẩn đoán riêng đang chờ sweep/MSS/FVG/retracement và lý do setup bị loại gần nhất (ghi rõ thời điểm, là lịch sử chứ không khẳng định lý do chờ hiện tại). Chẩn đoán chỉ đọc, không thêm trường vào journal V3 hoặc thay đổi kết quả replay.
+Heartbeat tách riêng `Risk/session halt`, trạng thái feed, tổng retry/recovery của phiên và entry window tại nến cuối đã xử lý. `Risk/session halt: false` không đồng nghĩa đang trong giờ vào lệnh. Chế độ `always` hiển thị `OPEN (24/7, including weekends)`; `killzones` theo `America/New_York`, thứ Hai–thứ Sáu, có DST. Cả hai kèm thời điểm nến theo Việt Nam. Ngày 29/10/2026, riêng chế độ `killzones` có cửa sổ 13:00–16:00 và 18:00–21:00 Việt Nam. Lệnh paper đang tồn tại vẫn được mô phỏng ngoài giờ tạo entry. Discovery BTC/ETH có chẩn đoán riêng đang chờ sweep/MSS/FVG/retracement và lý do setup bị loại gần nhất (ghi rõ thời điểm, là lịch sử chứ không khẳng định lý do chờ hiện tại). Chẩn đoán chỉ đọc, không thêm trường vào journal V3 hoặc thay đổi kết quả replay.
 
 Thiết lập lần đầu bằng **bot mới dành riêng cho paper**:
 
@@ -58,7 +58,7 @@ Thiết lập lần đầu bằng **bot mới dành riêng cho paper**:
    ```
 
    Các dòng trên là placeholder, không phải giá trị dùng được. Không thêm exchange API key. Nếu chưa tạo bot, bỏ các biến này hoặc để `TELEGRAM_ENABLED=false`.
-4. Sau khi bản code mới được deploy, kiểm tra tin `[PAPER V3] STARTED`, rồi heartbeat. Tin `LIMIT PLACED / NOT FILLED` không có nghĩa đã có vị thế. Không cần mở port/domain/webhook cho notifier.
+4. Sau khi bản code mới được deploy, kiểm tra tin `[PAPER V4] STARTED`, rồi heartbeat. Tin `LIMIT PLACED / NOT FILLED` không có nghĩa đã có vị thế. Không cần mở port/domain/webhook cho notifier.
 
 Notifier có hàng đợi riêng giới hạn 64 tin, timeout và phản hồi giới hạn kích thước; lỗi gửi không làm chậm vòng xử lý nến. Chỉ retry một lần với 429 có `retry_after` hợp lệ; lỗi mạng không được tự gửi lại để tránh nhân đôi kết quả chưa rõ. Không log token/URL chứa token. Đây là **best-effort, không phải durable outbox/exactly-once**: mạng lỗi, queue đầy, crash hoặc hết thời gian shutdown có thể mất tin; JSONL mới là bằng chứng phiên. Xem lỗi và delivery counters trong console. [Telegram Bot API](https://core.telegram.org/bots/api#sendmessage)
 
@@ -67,12 +67,19 @@ Notifier có hàng đợi riêng giới hạn 64 tin, timeout và phản hồi g
 Docker CMD mới mặc định chạy portfolio BTC/ETH x10, nhưng **Custom Start Command cũ sẽ override mặc định này**. Sau khi chủ động chọn thời điểm kết thúc phiên cũ, dùng lệnh:
 
 ```text
-/usr/local/bin/paper portfolio --symbols BTCUSDT,ETHUSDT --leverage 10 --balance 100
+/usr/local/bin/paper portfolio --symbols BTCUSDT,ETHUSDT --leverage 10 --balance 100 --entry-window always
 ```
 
 Giữ volume `/data`, một instance và chính sách restart được mô tả bên dưới. Đặt `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15` để có thời gian xử lý SIGTERM, ghi summary và drain Telegram (tối đa khoảng 5 giây); overlap nên để 0 và chủ động dừng phiên cũ trước khi đổi bản. Railway mặc định có thể force-stop ngay nếu không cấu hình draining; tin dừng cuối không được bảo đảm khi SIGKILL/crash. [Deployment teardown](https://docs.railway.com/deployments/deployment-teardown)
 
 Sao lưu log phiên cũ; rollout tạo phiên 100 USDT mới, không tự chuyển số dư/vị thế đang có. Code mới và Variables chỉ có hiệu lực trên deployment tương ứng; việc viết code cục bộ không thay đổi service đang chạy.
+
+### Kiểm chứng v4 entry 24/7 (29/10/2026)
+
+- Native Windows/MSVC Rust 1.89: **474 test all-features** (410 library + 64 CLI), **368 test no-default-features** (304 + 64), Clippy all-targets `-D warnings` ở cả hai cấu hình và release `paper --no-default-features` đạt. Test gồm setup ban đêm/cuối tuần, giữ policy khi thay discovery sau mỗi intent, giới hạn risk/slot không đổi, heartbeat đúng policy, V4 replay chính xác với nhiều giao dịch ngoài killzone và từ chối policy sai/thiếu/null/bị sửa.
+- CLI `portfolio` mặc định `always`, kể cả Custom Start Command Railway cũ không có cờ giờ. `MultiPortfolio::new` của thư viện và log V3 giữ killzones để tương thích; header V4 bắt buộc lưu rõ `entry_window`. Không đổi policy khi replay bằng tham số CLI.
+- Release chạy 75 giây sau 500 batch warmup/cặp, nhận một batch mới, in `entry_window=always`, equity 100 USDT, 0 trade; Telegram tắt trong smoke. Header được kiểm tra `version=4`, `entry_window=always`; replay V4 cùng SHA-256. V1 replay khớp baseline replay cũ, V2/V3 khớp log nguồn. Bằng chứng: `paper-runs/verification-20261029-v4-always-report.json` (Git bỏ qua).
+- Kiểm thử chỉ xác nhận hành vi phần mềm, chưa đánh giá hiệu quả chế độ 24/7. Rustfmt chưa chạy lại do giới hạn môi trường đã ghi ở mốc trước; không thay đổi Windows Security. Build/runtime Railway cần xác nhận riêng sau push.
 
 ### Kiểm chứng giảm polling và chẩn đoán vận hành (29/10/2026)
 
@@ -182,7 +189,7 @@ Thiết lập trên Railway Dashboard:
 5. Lần đầu đặt Custom Start Command để thử 5 phút sau warmup:
 
    ```text
-   /usr/local/bin/paper portfolio --symbols BTCUSDT,ETHUSDT --leverage 10 --balance 100 --seconds 300
+   /usr/local/bin/paper portfolio --symbols BTCUSDT,ETHUSDT --leverage 10 --balance 100 --entry-window always --seconds 300
    ```
 
    Đây là lệnh đầy đủ vì Railway override `ENTRYPOINT` của Docker image. Khi đã kiểm tra log, volume và kết nối public Bybit, bỏ Custom Start Command để dùng mặc định portfolio BTC/ETH x10 liên tục, hoặc giữ lệnh trên nhưng bỏ `--seconds 300`. Việc redeploy này vẫn bắt đầu **phiên mới**, không nối tiếp phiên thử. [Start command](https://docs.railway.com/deployments/start-command)
@@ -213,7 +220,7 @@ Named volume trên máy chỉ dùng cho ví dụ cục bộ, không phải Railw
 | Durability liên lớp | `src/journal.rs`, `src/durability.rs`, `src/risk/checkpoint.rs`, `src/execution/coordinator/checkpoint.rs` | Journal khóa độc quyền, checkpoint risk/execution và outbox chung; sync trước khi giao side effect cho caller; khôi phục bằng chứng và replay tombstone, không tự gửi lại lệnh. |
 | Inventory chỉ đọc | `src/reconciliation.rs`, `src/reconciliation/` | Quét GET theo phạm vi venue đã khai báo, pagination có giới hạn và so sánh định danh với execution cục bộ; không sửa lệnh, giải phóng risk hay cấp quyền entry. |
 | PAPER keyless | `src/paper/`, `src/bin/paper.rs`, `src/bin/paper/session.rs` | Public Bybit REST → ICT/strategy/risk → broker mô phỏng, số dư/phí/equity, JSONL và replay offline; tách biệt với authenticated execution. |
-| Portfolio/observer | `src/paper/book.rs`, `src/paper/multi_portfolio.rs`, `src/bin/paper/multi_session.rs`, `src/bin/paper/portfolio_runner.rs`, `src/telegram.rs` | V3: BTC/ETH nhiều setup độc lập, vốn/risk chung, log/replay versioned, Telegram opt-in; giữ engine/journal v2 để replay lịch sử. |
+| Portfolio/observer | `src/paper/book.rs`, `src/paper/multi_portfolio.rs`, `src/bin/paper/multi_session.rs`, `src/bin/paper/portfolio_runner.rs`, `src/telegram.rs` | V4: entry 24/7 hoặc killzones, BTC/ETH nhiều setup độc lập, vốn/risk chung, log/replay versioned, Telegram opt-in; giữ engine/journal v2 để replay lịch sử. |
 
 Các actor dùng bounded `tokio::sync::mpsc`; candle store dùng `Arc<RwLock<_>>`. Phần tính toán và coordinator có API đồng bộ để kiểm thử độc lập với mạng. `OrderBlock` hiện là domain model; không nên hiểu sự có mặt của model là đã có một chiến lược order-block riêng.
 
@@ -221,7 +228,7 @@ Killzone dùng `America/New_York`, có chuyển EST/EDT theo DST: London `[02:00
 
 ## Risk và execution
 
-Risk thư viện mặc định là 1% equity mỗi trade, tối đa 5% tổng planned risk đang được reservation; **runner PAPER portfolio v3 đặt riêng tổng risk 3%**, drawdown ngày 5% và RR tối thiểu 2. Quantity luôn làm tròn xuống theo step. SL được đẩy ít nhất một tick ra ngoài extreme của sweep; RR được kiểm tra lại sau rounding. Circuit breaker so với opening equity của ngày UTC và giữ trạng thái tripped trong ngày, kể cả khi equity phục hồi. Caller phải cung cấp baseline đúng của ngày và equity snapshot còn mới; snapshot intraday không tự đặt lại baseline.
+Risk thư viện mặc định là 1% equity mỗi trade, tối đa 5% tổng planned risk đang được reservation; **runner PAPER portfolio v3/v4 đặt riêng tổng risk 3%**, drawdown ngày 5% và RR tối thiểu 2. Quantity luôn làm tròn xuống theo step. SL được đẩy ít nhất một tick ra ngoài extreme của sweep; RR được kiểm tra lại sau rounding. Circuit breaker so với opening equity của ngày UTC và giữ trạng thái tripped trong ngày, kể cả khi equity phục hồi. Caller phải cung cấp baseline đúng của ngày và equity snapshot còn mới; snapshot intraday không tự đặt lại baseline.
 
 `ExecutionCoordinator` quản lý một venue/account và chỉ cho một bracket đang hoạt động. Account cần dành riêng cho coordinator, ở chế độ one-way/net. Khi khởi tạo, coordinator chặn entry cho đến khi nhận một `FlatAccountSnapshot` còn mới, được đối soát đầy đủ sau khi subscribe: không có regular order, algo/conditional order hoặc position trên bất kỳ symbol nào. Struct này chỉ là contract của caller. Inventory scanner mới cung cấp bằng chứng đọc theo scope, không chuyển thành `FlatAccountSnapshot` và chưa thay thế đối soát toàn tài khoản.
 

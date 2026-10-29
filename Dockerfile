@@ -29,4 +29,4 @@ ENTRYPOINT ["/usr/local/bin/paper"]
 # Continuous public-data simulation, not real trading. Each launch starts a
 # NEW virtual account and a unique create_new log in /data/paper-runs/; stored
 # logs are not automatically resumed. Do not replace this with a fixed output.
-CMD ["portfolio", "--symbols", "BTCUSDT,ETHUSDT", "--leverage", "10", "--balance", "100"]
+CMD ["portfolio", "--symbols", "BTCUSDT,ETHUSDT", "--leverage", "10", "--balance", "100", "--entry-window", "always"]

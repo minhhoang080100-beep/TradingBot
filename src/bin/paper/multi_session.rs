@@ -1,5 +1,6 @@
-//! Version 3 audit for one shared paper account with multiple active orders.
+//! Versioned audit for one shared paper account with multiple active orders.
 //!
+//! V3 retains its fixed killzone policy; V4 records the explicit entry window.
 //! Legacy v1/v2 readers and engines remain unchanged. Complete replay verifies
 //! every batch and final accounting before creating an output file. An aborted
 //! journal is diagnostic evidence, never a verified replay or a resume file.
@@ -13,8 +14,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use ict_trading_bot::{
     paper::{
-        MultiPortfolio, MultiPortfolioSnapshot, MultiPortfolioStep, PaperConfig, PaperInstrument,
-        PortfolioEvent,
+        MultiPortfolio, MultiPortfolioSnapshot, MultiPortfolioStep, PaperConfig, PaperEntryWindow,
+        PaperInstrument, PortfolioEvent,
     },
     Candle, Timeframe,
 };
@@ -28,6 +29,7 @@ use super::session::{
 };
 
 const ALGORITHM: &str = "ict-paper-portfolio-v3";
+const ALGORITHM_V4: &str = "ict-paper-portfolio-v4";
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_LINE: usize = 64 * 1024;
 const MAX_BATCHES: usize = 100_000;
@@ -35,7 +37,7 @@ const MAX_CANDLES_PER_BATCH: usize = 2;
 const MAX_ACTIVE_TOTAL: u32 = 4;
 const MAX_ACTIVE_PER_SYMBOL: u32 = 2;
 
-/// Fully specified assumptions for the fixed v3 multi-order algorithm.
+/// Fully specified assumptions for a versioned multi-order algorithm.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MultiHeader {
@@ -56,6 +58,16 @@ pub struct MultiHeader {
     risk_per_trade: String,
     max_total_risk: String,
     daily_drawdown_limit: String,
+    // Missing is valid only for historical V3. Explicit null is never a policy.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_entry_window")]
+    entry_window: Option<PaperEntryWindow>,
+}
+
+fn present_entry_window<'de, D>(deserializer: D) -> Result<Option<PaperEntryWindow>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    PaperEntryWindow::deserialize(deserializer).map(Some)
 }
 
 impl MultiHeader {
@@ -79,7 +91,18 @@ impl MultiHeader {
             risk_per_trade: "0.01".to_owned(),
             max_total_risk: "0.03".to_owned(),
             daily_drawdown_limit: "0.05".to_owned(),
+            entry_window: None,
         }
+    }
+
+    /// Captures the explicit entry window in a V4 header without changing risk.
+    pub fn new_with_entry_window(instruments: &[PaperInstrument], config: PaperConfig,
+        session_id: Uuid, entry_window: PaperEntryWindow) -> Self {
+        let mut header = Self::new(instruments, config, session_id);
+        header.version = 4;
+        ALGORITHM_V4.clone_into(&mut header.algorithm);
+        header.entry_window = Some(entry_window);
+        header
     }
 
     /// Restores a fresh deterministic engine, never live positions or secrets.
@@ -88,7 +111,12 @@ impl MultiHeader {
     /// Rejects unsupported versions/policy, malformed decimals or metadata,
     /// invalid simulation assumptions, and an invalid instrument universe.
     pub fn engine(&self) -> Result<MultiPortfolio, BoxError> {
-        if self.version != 3 || self.algorithm != ALGORITHM || self.session_id.is_nil() {
+        let entry_window = match (self.version, self.algorithm.as_str(), self.entry_window) {
+            (3, ALGORITHM, None) => PaperEntryWindow::Killzones,
+            (4, ALGORITHM_V4, Some(policy)) => policy,
+            _ => return Err(invalid("unsupported multi-order session header or entry window")),
+        };
+        if self.session_id.is_nil() {
             return Err(invalid("unsupported multi-order session header"));
         }
         if self.max_active_total != MAX_ACTIVE_TOTAL
@@ -112,7 +140,7 @@ impl MultiHeader {
             .iter()
             .map(InstrumentDto::restore)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(MultiPortfolio::new(instruments, config, self.timeframe)?)
+        Ok(MultiPortfolio::new_with_entry_window(instruments, config, self.timeframe, entry_window)?)
     }
 }
 
@@ -252,7 +280,7 @@ impl MultiLog {
     }
 }
 
-/// Identifies v3 without interpreting it as a legacy one-position session.
+/// Identifies V3/V4 without interpreting them as legacy one-position sessions.
 ///
 /// # Errors
 /// Rejects unreadable, oversized, truncated or duplicate-key first records.
@@ -260,11 +288,13 @@ pub fn is_multi(input: &Path) -> Result<bool, BoxError> {
     let mut reader = BufReader::new(File::open(input)?);
     let first = next_line(&mut reader, &mut 0)?.ok_or_else(|| invalid("empty paper session"))?;
     let value = serde_json::from_slice::<UniqueValue>(&first)?.0;
-    Ok(value.get("header").and_then(|header| header.get("algorithm")).and_then(Value::as_str)
-        == Some(ALGORITHM))
+    let header = value.get("header");
+    let algorithm = header.and_then(|header| header.get("algorithm")).and_then(Value::as_str);
+    let version = header.and_then(|header| header.get("version")).and_then(Value::as_u64);
+    Ok(matches!(algorithm, Some(ALGORITHM | ALGORITHM_V4)) || matches!(version, Some(3 | 4)))
 }
 
-/// Verifies all deterministic outcomes before creating a derived v3 journal.
+/// Verifies all deterministic outcomes before creating a derived V3/V4 journal.
 ///
 /// # Errors
 /// Rejects unsupported/tampered/aborted/incomplete sessions, input bounds,
@@ -520,14 +550,19 @@ mod tests {
 
     fn complete_trade_session(path: &Path) -> Result<(MultiPortfolioSnapshot, Vec<PortfolioEvent>), BoxError> {
         let header = header()?;
+        complete_trade_session_with_header(path, &header, 0)
+    }
+
+    fn complete_trade_session_with_header(path: &Path, header: &MultiHeader, minute_offset: i64)
+        -> Result<(MultiPortfolioSnapshot, Vec<PortfolioEvent>), BoxError> {
         let mut engine = header.engine()?;
-        let mut log = MultiLog::create(path, &header)?;
+        let mut log = MultiLog::create(path, header)?;
         let mut events = Vec::new();
         for (minute, prices) in trade_prices().into_iter().enumerate() {
             events.extend(append_trade_batch(
                 &mut log,
                 &mut engine,
-                &trade_batch(i64::try_from(minute)?, prices, prices)?,
+                &trade_batch(i64::try_from(minute)? + minute_offset, prices, prices)?,
                 minute < 24,
             )?);
         }
@@ -541,15 +576,112 @@ mod tests {
             events.extend(append_trade_batch(
                 &mut log,
                 &mut engine,
-                &trade_batch(minute, btc, eth)?,
+                &trade_batch(minute + minute_offset, btc, eth)?,
                 false,
             )?);
         }
-        let shutdown = engine.shutdown(trade_at(28)?)?;
+        let shutdown = engine.shutdown(trade_at(28 + minute_offset)?)?;
         let snapshot = engine.snapshot();
-        log.finish(trade_at(28)?, "duration_elapsed", &snapshot, &shutdown)?;
+        log.finish(trade_at(28 + minute_offset)?, "duration_elapsed", &snapshot, &shutdown)?;
         events.extend(shutdown);
         Ok((snapshot, events))
+    }
+
+    #[test]
+    fn v4_always_replays_real_outside_window_trades_and_preserves_risk() -> Result<(), BoxError> {
+        let temp = Temp::new()?;
+        let header = MultiHeader::new_with_entry_window(&instruments()?,
+            PaperConfig::default().with_leverage(10)?, Uuid::new_v4(), PaperEntryWindow::Always);
+        let input = temp.path("v4-outside-window.jsonl");
+        let output = temp.path("v4-verified.jsonl");
+        // Shift the same real ICT setup to 01:00 New York, outside both windows.
+        let (expected, events) = complete_trade_session_with_header(&input, &header, -360)?;
+        assert_eq!(expected.account.completed_trades, 2);
+        assert_eq!(events.iter().filter(|event| matches!(event, PortfolioEvent::EntryPlaced { .. })).count(), 2);
+        assert!(is_multi(&input)?);
+        assert_eq!(replay(&input, &output)?, expected);
+        assert_eq!(fs::read(&input)?, fs::read(&output)?);
+        let rows = records(&input)?;
+        assert_eq!(rows[0]["header"]["version"], 4);
+        assert_eq!(rows[0]["header"]["algorithm"], ALGORITHM_V4);
+        assert_eq!(rows[0]["header"]["entry_window"], "always");
+        assert_eq!(rows[0]["header"]["max_active_total"], 4);
+        assert_eq!(rows[0]["header"]["max_active_per_symbol"], 2);
+        assert_eq!(rows[0]["header"]["risk_per_trade"], "0.01");
+        assert_eq!(rows[0]["header"]["max_total_risk"], "0.03");
+        assert_eq!(rows[0]["header"]["daily_drawdown_limit"], "0.05");
+        for row in rows.iter().filter(|row| row["record"] == "batch") {
+            let account = &row["step"]["snapshot"]["account"];
+            assert!(decimal(account["reserved_risk"].as_str().ok_or("missing risk")?)? <= Decimal::from(3));
+        }
+
+        // Changing only a valid policy must fail through deterministic outcomes,
+        // not merely because the altered header has an invalid schema.
+        let mut changed = rows;
+        changed[0]["header"]["entry_window"] = Value::from("killzones");
+        let tampered = temp.path("v4-policy-tampered.jsonl");
+        let rejected = temp.path("v4-policy-rejected.jsonl");
+        store_records(&tampered, &changed)?;
+        let error = replay(&tampered, &rejected).err().ok_or("changed policy accepted")?;
+        assert!(error.to_string().contains("batch outcome does not reproduce"));
+        assert!(!rejected.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn v4_killzones_and_legacy_v3_keep_the_same_outside_window_behavior() -> Result<(), BoxError> {
+        let temp = Temp::new()?;
+        let legacy = header()?;
+        assert_eq!(legacy.engine()?.entry_window(), PaperEntryWindow::Killzones);
+        let legacy_value = serde_json::to_value(&legacy)?;
+        assert!(legacy_value.get("entry_window").is_none());
+        let v4 = MultiHeader::new_with_entry_window(&instruments()?,
+            PaperConfig::default().with_leverage(10)?, Uuid::new_v4(), PaperEntryWindow::Killzones);
+        for (name, header) in [("legacy", legacy), ("v4-killzones", v4)] {
+            let input = temp.path(&format!("{name}.jsonl"));
+            let output = temp.path(&format!("{name}-verified.jsonl"));
+            let (expected, events) = complete_trade_session_with_header(&input, &header, -360)?;
+            assert_eq!(expected.account.completed_trades, 0);
+            assert!(!events.iter().any(|event| matches!(event, PortfolioEvent::EntryPlaced { .. })));
+            assert_eq!(replay(&input, &output)?, expected);
+            assert_eq!(fs::read(&input)?, fs::read(&output)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn entry_window_header_rejects_missing_null_unknown_and_legacy_injection() -> Result<(), BoxError> {
+        let legacy = serde_json::to_value(header()?)?;
+        for policy in [Value::from("always"), Value::from("killzones"), Value::Null] {
+            let mut changed = legacy.clone();
+            changed["entry_window"] = policy;
+            let restored = serde_json::from_value::<MultiHeader>(changed);
+            assert!(restored.map_or(true, |header| header.engine().is_err()));
+        }
+        let valid = MultiHeader::new_with_entry_window(&instruments()?,
+            PaperConfig::default().with_leverage(10)?, Uuid::new_v4(), PaperEntryWindow::Always);
+        let encoded = serde_json::to_value(valid)?;
+        for index in 0..7 {
+            let mut changed = encoded.clone();
+            match index {
+                0 => { changed.as_object_mut().ok_or("missing header")?.remove("entry_window"); }
+                1 => changed["entry_window"] = Value::Null,
+                2 => changed["entry_window"] = Value::from("sometimes"),
+                3 => changed["entry_window"] = Value::from(true),
+                4 => changed["algorithm"] = Value::from(ALGORITHM),
+                5 => changed["version"] = Value::from(3),
+                _ => changed["max_total_risk"] = Value::from("0.04"),
+            }
+            let restored = serde_json::from_value::<MultiHeader>(changed);
+            assert!(restored.map_or(true, |header| header.engine().is_err()), "accepted mutation {index}");
+        }
+        let header: MultiHeader = serde_json::from_value(encoded)?;
+        let raw = String::from_utf8(encode(&Record::Header { header: Box::new(header) })?)?;
+        let duplicate = raw.replacen("\"entry_window\":\"always\"",
+            "\"entry_window\":\"always\",\"entry_window\":\"killzones\"", 1);
+        assert_ne!(raw, duplicate);
+        assert!(decode(duplicate.as_bytes()).is_err());
+        Ok(())
     }
 
     #[test]
