@@ -29,9 +29,15 @@ under Always at both costs. Four extra Always profiles test a fixed one-bar
 entry embargo for both target policies and cost assumptions. This is a timing
 sensitivity test, not a real latency model. Eight entry-v2 profiles additionally
 place a resting CE limit at FVG confirmation, retaining confirmed setup context;
-both target policies, costs and fill timings are compared. Risk is not tuned.
+both target policies, costs and fill timings are compared. Sixteen mandatory
+BTC/ETH SMT profiles cross 3/5-candle M1 fractals, optional confirmed-M5 alignment,
+both costs and both fill timings; all retain genuine M1 MSS/FVG confirmation.
+Risk and the net RR floor of 2 are not tuned to force more fills.
 Reports include source/config hashes, costs, drawdown, unclosed exposure,
-trade events, and explicit limitations. Output must not already exist.
+trade events, SMT admission evidence, actual filled-entry frequency including
+zero-entry days, and holding times. The frequency goal is strictly more than
+10 fills/day across the portfolio; reports say whether it was met.
+Output must not already exist.
 Results are UNVALIDATED: OHLC simulation excludes funding and liquidation.
 ";
 
@@ -86,7 +92,7 @@ fn run(options: &Options) -> Result<(), BoxError> {
         "split_at": options.split_at,
         "results": report["results"].as_array().map(|rows| rows.iter().map(|row| json!({
             "profile": row["profile"], "segment": row["segment"], "metrics": row["metrics"],
-            "warnings": row["warnings"],
+            "frequency": row["frequency"], "warnings": row["warnings"],
         })).collect::<Vec<_>>()),
     }))?);
     Ok(())

@@ -568,6 +568,8 @@ fn admission_failure_label(kind: ict_trading_bot::paper::AdmissionFailureKind) -
         K::NoOpposingLiquidity => "thiếu thanh khoản đối diện để đặt TP",
         K::DuplicateSetup => "setup đã được xét",
         K::SessionHalted => "phiên đang chặn lệnh mới",
+        K::SmtRequired => "SMT BTC–ETH chưa đủ hoặc đã mất hiệu lực",
+        K::M5Alignment => "hướng M5 chưa đồng thuận",
     }
 }
 
@@ -598,6 +600,8 @@ fn rejection_label(reason: ict_trading_bot::paper::MultiRejection) -> &'static s
         R::RiskRule => "chưa đạt điều kiện rủi ro/TP", R::MinimumOrder => "nhỏ hơn khối lượng tối thiểu",
         R::InsufficientBalance => "thiếu vốn ký quỹ và phí", R::NetRiskReward => "lời/lỗ sau chi phí dưới 2:1",
         R::StrategyInput => "dữ liệu setup không nhất quán",
+        R::SmtRequired => "SMT BTC–ETH chưa đủ hoặc đã mất hiệu lực",
+        R::M5Alignment => "hướng M5 chưa đồng thuận",
     }
 }
 

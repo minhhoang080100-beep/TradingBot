@@ -26,6 +26,7 @@ use super::{
     broker::{PaperConfig, PaperError, PaperEvent, PaperFillTiming},
     market::PaperInstrument,
     portfolio::{PortfolioError, PortfolioEvent},
+    smt_research::{SmtGateFailure, SmtResearchConfig, SmtResearchError, SmtResearchReport, SmtResearchState},
 };
 
 const MAX_RETAINED_BATCHES: usize = 100_000;
@@ -157,6 +158,10 @@ pub enum AdmissionFailureKind {
     DuplicateSetup,
     /// The session is already blocking new risk.
     SessionHalted,
+    /// Required paired divergence expired or was invalidated before admission.
+    SmtRequired,
+    /// Completed M5 structure did not align with the proposed direction.
+    M5Alignment,
 }
 
 /// Most recent rejected live intent, retained as historical context only.
@@ -321,6 +326,10 @@ pub enum MultiRejection {
     NetRiskReward,
     /// Strategy rejected an inconsistent analysis input.
     StrategyInput,
+    /// Required active BTC-ETH SMT proof is absent at entry.
+    SmtRequired,
+    /// Entry does not align with the last fully closed M5 structure.
+    M5Alignment,
 }
 
 /// Per-symbol counters for this batch, not cumulative session totals.
@@ -369,6 +378,8 @@ impl RejectedAdmission {
             MultiRejection::MinimumOrder => Some(AdmissionFailureKind::MinimumOrder),
             MultiRejection::InsufficientBalance => Some(AdmissionFailureKind::InsufficientBalance),
             MultiRejection::NetRiskReward => Some(AdmissionFailureKind::NetRiskReward),
+            MultiRejection::SmtRequired => Some(AdmissionFailureKind::SmtRequired),
+            MultiRejection::M5Alignment => Some(AdmissionFailureKind::M5Alignment),
             MultiRejection::Warmup | MultiRejection::RiskRule | MultiRejection::StrategyInput => None,
         };
         Self { reason, diagnostic: kind.map(|kind| Self::detail(kind, intent, at, target_price)) }
@@ -438,6 +449,9 @@ pub enum MultiPortfolioError {
     /// Shared book accounting or lifecycle failure.
     #[error(transparent)]
     Book(#[from] BookError),
+    /// Paired SMT or completed M5 research validation failed.
+    #[error(transparent)]
+    SmtResearch(#[from] SmtResearchError),
 }
 
 impl From<RiskError> for MultiPortfolioError {
@@ -568,6 +582,7 @@ pub struct MultiPortfolio {
     entry_window: PaperEntryWindow,
     target_policy: PaperTargetPolicy,
     entry_policy: StrategyEntryPolicy,
+    smt_research: Option<SmtResearchState>,
     risk: RiskManager,
     book: PaperBook,
     history: BTreeMap<DateTime<Utc>, Vec<Candle>>,
@@ -669,8 +684,42 @@ impl MultiPortfolio {
             }
         }
         Ok(Self { symbols, owners: BTreeMap::new(), consumed_mss: BTreeSet::new(),
-            consumed_fvg: BTreeSet::new(), timeframe, entry_window, target_policy, entry_policy, risk, book: PaperBook::new_for_research(config, fill_timing)?,
+            consumed_fvg: BTreeSet::new(), timeframe, entry_window, target_policy, entry_policy, smt_research: None,
+            risk, book: PaperBook::new_for_research(config, fill_timing)?,
             history: BTreeMap::new(), phase: Phase::WarmingUp, insolvent: false })
+    }
+
+    /// Creates an offline BTC/ETH portfolio requiring causal paired SMT evidence.
+    ///
+    /// Every intent still requires genuine M1 MSS, displacement and next-candle
+    /// FVG. The optional M5 alignment is a trend-pullback hypothesis, not a BOS
+    /// mislabeled as MSS. Entry stays 24/7; the fixed risk/slot limits apply.
+    /// No live CLI or V1-V4 journal selects this policy.
+    ///
+    /// # Errors
+    /// Requires both assets, 100 USDT, x10 and a net RR floor of at least two.
+    pub fn new_for_smt_research(instruments: Vec<PaperInstrument>, config: PaperConfig,
+        research: SmtResearchConfig) -> Result<Self, MultiPortfolioError> {
+        if instruments.len() != 2 || config.initial_balance() != Decimal::from(100)
+            || config.leverage() != 10 || config.min_net_rr() < Decimal::TWO {
+            return Err(PortfolioError::Configuration("SMT research requires BTC+ETH, 100 USDT, x10 and net RR >=2").into());
+        }
+        let mut engine = Self::new_for_research_with_entry_policy(instruments, config, Timeframe::M1,
+            PaperEntryWindow::Always, PaperTargetPolicy::NearestViable, research.fill_timing,
+            StrategyEntryPolicy::RestingOnConfirmation)?;
+        let default = IctEngineConfig::default();
+        let ict_config = IctEngineConfig::new(research.fractal_model, default.break_basis(), default.fvg_mitigation(),
+            default.sweep_confirmation(), default.limits(), default.displacement().clone(), default.killzones())
+            .map_err(PortfolioError::from)?;
+        for state in engine.symbols.values_mut() { state.ict = IctEngine::new(ict_config.clone()); }
+        engine.smt_research = Some(SmtResearchState::new(research));
+        Ok(engine)
+    }
+
+    /// Immutable research proof log; absent for ordinary or poisoned sessions.
+    #[must_use]
+    pub fn smt_research_report(&self) -> Option<&SmtResearchReport> {
+        if self.is_poisoned() { None } else { self.smt_research.as_ref().map(|state| &state.report) }
     }
 
     /// Returns the policy retained by this session and all fresh discoveries.
@@ -791,17 +840,31 @@ impl MultiPortfolio {
             step.events.extend(cancellations);
         }
         if !was_halted && self.entry_halted() { step.events.push(PortfolioEvent::Halted { at }); }
+        // Analyze both assets at the same close before any paired decision.
+        // Sequential admission remains stable BTC then ETH, but neither reads
+        // a peer detector from the preceding minute.
+        let mut analyzed = Vec::with_capacity(ordered.len());
+        for candle in &ordered {
+            let batch = self.state_mut(candle.instrument().venue_symbol.as_str())?.analyze(candle)?;
+            analyzed.push((*candle, batch));
+        }
+        if let Some(research) = &mut self.smt_research { research.analyze(&analyzed, warmup)?; }
+        self.cancel_lost_smt_pending(at, &mut step.events)?;
+        let allowed_sweeps = self.smt_research.as_ref().map(SmtResearchState::allowed_sweeps);
         let mut live_updates = Vec::with_capacity(self.symbols.len());
-        for (candle, analysis) in ordered.iter().zip(&mut step.analysis) {
+        for ((candle, batch), analysis) in analyzed.into_iter().zip(&mut step.analysis) {
             let symbol = candle.instrument().venue_symbol.as_str();
             let state = self.state_mut(symbol)?;
-            let batch = state.analyze(candle)?;
             let mut live = (!warmup).then(|| state.live.clone());
             analysis.signals = batch.signals().len();
             if let Some(counters) = &mut live { counters.observe_detection(&batch, at); }
             let event = IctEngineEvent::CandleAnalyzed { candle: (*candle).clone(), batch };
             self.advance_owners(symbol, &event, analysis, &mut step.events)?;
-            let actions = self.state_mut(symbol)?.discovery.process_event(event)?;
+            let discovery = &mut self.state_mut(symbol)?.discovery;
+            let actions = match &allowed_sweeps {
+                Some(allowed) => discovery.process_event_with_sweep_filter(event, allowed)?,
+                None => discovery.process_event(event)?,
+            };
             if let Some(counters) = &mut live { counters.observe_actions(&actions); }
             let admission_failures = self.discovery_actions(symbol, actions, candle, warmup, analysis, &mut step.events)?;
             if let Some(mut counters) = live {
@@ -818,6 +881,24 @@ impl MultiPortfolio {
         }
         step.snapshot = self.snapshot();
         Ok(step)
+    }
+
+    fn cancel_lost_smt_pending(&mut self, at: DateTime<Utc>, events: &mut Vec<PortfolioEvent>) -> Result<(), MultiPortfolioError> {
+        let Some(research) = &self.smt_research else { return Ok(()); };
+        let pending = self.book.snapshot().orders.iter().filter(|order| order.state == super::book::BookOrderState::Pending)
+            .map(|order| order.order.intent_id).collect();
+        let lost = research.lost_pending(&pending);
+        // The book already processed this bar. Never retroactively erase a fill
+        // using a peer breach only observed at the end of that same bar.
+        for intent_id in lost {
+            let cancelled = self.book.cancel_intent(intent_id, at)?;
+            self.route_events(&cancelled)?;
+            events.extend(cancelled);
+            if let Some(research) = &mut self.smt_research {
+                research.report.pending_cancelled_after_smt_lost = research.report.pending_cancelled_after_smt_lost.saturating_add(1);
+            }
+        }
+        Ok(())
     }
 
     fn validate_batch<'a>(&self, candles: &'a [Candle]) -> Result<Vec<&'a Candle>, PortfolioError> {
@@ -921,6 +1002,12 @@ impl MultiPortfolio {
                     if let Some(rejected) = self.submit_intent(symbol, &intent, owner, candle, warmup, events)? {
                         analysis.reject(rejected.reason);
                         if let Some(diagnostic) = rejected.diagnostic { failures.push(diagnostic); }
+                    } else if let Some(research) = &mut self.smt_research {
+                        let order = events.iter().rev().find_map(|event| match event {
+                            PortfolioEvent::EntryPlaced { order, .. } if order.intent_id == intent.id() => Some(order.clone()),
+                            _ => None,
+                        }).ok_or(PortfolioError::Invariant("admitted SMT intent missing its entry event"))?;
+                        research.record_admission(&intent, candle.close_time(), order)?;
                     }
                 }
                 StrategyAction::InputRejected { .. } => analysis.reject(MultiRejection::StrategyInput),
@@ -971,6 +1058,14 @@ impl MultiPortfolio {
         }
         if self.owners.contains_key(&intent.id()) {
             return Err(PortfolioError::Invariant("intent identifier already has an owner").into());
+        }
+        if let Some(research) = &self.smt_research {
+            if let Some(failure) = research.gate(intent, at)? {
+                Self::reject_owner(&mut owner, intent.id(), at)?;
+                let reason = match failure { SmtGateFailure::Missing => MultiRejection::SmtRequired,
+                    SmtGateFailure::M5Alignment => MultiRejection::M5Alignment };
+                return Ok(Some(RejectedAdmission::simple(reason, intent, at, None)));
+            }
         }
         if self.target_policy == PaperTargetPolicy::NearestViable {
             return self.submit_research_target(symbol, intent, owner, candle, events);
@@ -1294,6 +1389,124 @@ mod tests {
             assert_eq!(engine.entry_policy(), StrategyEntryPolicy::RestingOnConfirmation);
             assert!(account.reserved_risk <= Decimal::from(3));
         }
+        Ok(())
+    }
+
+    fn smt_portfolio(alignment: bool) -> Result<MultiPortfolio, Box<dyn Error>> {
+        Ok(MultiPortfolio::new_for_smt_research(vec![metadata("BTCUSDT")?, metadata("ETHUSDT")?],
+            PaperConfig::default().with_leverage(10)?, SmtResearchConfig {
+                fractal_model: crate::models::FractalModel::FiveCandle,
+                require_m5_alignment: alignment, fill_timing: PaperFillTiming::ImmediateNextBar })?)
+    }
+
+    fn smt_peer(minute: usize) -> [i64; 4] {
+        if minute == 18 { [100, 102, 95, 101] } else { NEUTRAL }
+    }
+
+    fn smt_ready_pending() -> Result<MultiPortfolio, Box<dyn Error>> {
+        let mut engine = smt_portfolio(false)?;
+        for (index, row) in setup(150).into_iter().take(24).enumerate() {
+            engine.process_batch(&batch(i64::try_from(index)?, row, smt_peer(index))?)?;
+        }
+        assert_eq!(engine.snapshot().account.orders.len(), 1);
+        assert_eq!(engine.snapshot().account.orders[0].state, BookOrderState::Pending);
+        Ok(engine)
+    }
+
+    #[test]
+    fn smt_admission_has_frozen_paired_proof_and_is_input_order_independent() -> TestResult {
+        let mut forward = smt_portfolio(false)?;
+        let mut reversed = smt_portfolio(false)?;
+        for (index, row) in setup(150).into_iter().take(24).enumerate() {
+            let mut candles = batch(i64::try_from(index)?, row, smt_peer(index))?;
+            let expected = forward.process_batch(&candles)?;
+            candles.reverse();
+            let actual = reversed.process_batch(&candles)?;
+            assert_eq!(serde_json::to_value(expected)?, serde_json::to_value(actual)?);
+        }
+        let report = forward.smt_research_report().ok_or("missing SMT research")?;
+        assert_eq!(report.admissions.len(), 1);
+        let proof = &report.admissions[0];
+        assert_eq!(proof.approved_at, at(24)?);
+        assert_eq!(proof.smt.focus_anchor().candle_open_time(), at(18)?);
+        assert_eq!(proof.smt.peer_anchor().candle_open_time(), at(18)?);
+        assert_eq!(proof.smt.detected_at(), at(22)?);
+        assert_eq!(proof.smt.focus_sweep(), proof.intent.liquidity_sweep());
+        assert_eq!(proof.peer_at_admission.close_time(), proof.approved_at);
+        assert_eq!(proof.order.intent_id, proof.intent.id());
+        assert_eq!(serde_json::to_value(report)?, serde_json::to_value(reversed.smt_research_report())?);
+        assert!(forward.snapshot().account.reserved_risk <= Decimal::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn smt_missing_peer_both_swept_and_unknown_m5_do_not_admit() -> TestResult {
+        for (paired, both_swept, alignment) in [(false, false, false), (true, true, false), (true, false, true)] {
+            let mut engine = smt_portfolio(alignment)?;
+            let mut reasons = Vec::new();
+            for (index, row) in setup(150).into_iter().enumerate() {
+                let peer = if both_swept && index == 21 { [100, 102, 94, 101] }
+                    else if paired { smt_peer(index) } else { NEUTRAL };
+                let step = engine.process_batch(&batch(i64::try_from(index)?, row, peer)?)?;
+                reasons.extend(step.analysis.into_iter().flat_map(|analysis| analysis.rejection_reasons));
+            }
+            assert!(engine.snapshot().account.orders.is_empty());
+            assert_eq!(engine.snapshot().account.available_cash, Decimal::from(100));
+            assert!(engine.smt_research_report().ok_or("missing research")?.admissions.is_empty());
+            if alignment { assert!(reasons.contains(&MultiRejection::M5Alignment)); }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn smt_loss_cancels_unfilled_limit_but_never_retroactively_erases_same_bar_fill() -> TestResult {
+        for fill in [false, true] {
+            let mut engine = smt_ready_pending()?;
+            let btc = if fill { [110,112,103,109] } else { [110,112,106,109] };
+            engine.process_batch(&batch(24, btc, [100,102,94,101])?)?;
+            let account = engine.snapshot().account;
+            let report = engine.smt_research_report().ok_or("missing research")?;
+            if fill {
+                assert_eq!(account.orders.len(), 1);
+                assert_eq!(account.orders[0].state, BookOrderState::Open);
+                assert_eq!(report.pending_cancelled_after_smt_lost, 0);
+            } else {
+                assert!(account.orders.is_empty());
+                assert_eq!(account.fees_paid, Decimal::ZERO);
+                assert_eq!(account.reserved_risk, Decimal::ZERO);
+                assert_eq!(report.pending_cancelled_after_smt_lost, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn smt_warmup_never_creates_historical_orders_or_live_counts() -> TestResult {
+        let mut engine = smt_portfolio(false)?;
+        for (index, row) in setup(150).into_iter().enumerate() {
+            engine.warm_up(&batch(i64::try_from(index)?, row, smt_peer(index))?)?;
+        }
+        let report = engine.smt_research_report().ok_or("missing research")?;
+        assert_eq!(report.confirmed_smt, 0);
+        assert!(report.admissions.is_empty());
+        assert!(engine.snapshot().account.orders.is_empty());
+        assert_eq!(engine.snapshot().account.balance, Decimal::from(100));
+        Ok(())
+    }
+
+    #[test]
+    fn smt_research_cannot_relax_pair_account_leverage_or_net_rr_requirements() -> TestResult {
+        let research = SmtResearchConfig { fractal_model: crate::models::FractalModel::ThreeCandle,
+            require_m5_alignment: false, fill_timing: PaperFillTiming::ImmediateNextBar };
+        assert!(PaperConfig::new(Decimal::from(100), Decimal::new(6,4), Decimal::TWO,
+            Decimal::ONE, Decimal::ONE).is_err());
+        for config in [PaperConfig::default(),
+            PaperConfig::new(Decimal::from(200), Decimal::new(6,4), Decimal::TWO, Decimal::ONE, Decimal::TWO)?.with_leverage(10)?] {
+            assert!(MultiPortfolio::new_for_smt_research(vec![metadata("BTCUSDT")?, metadata("ETHUSDT")?],
+                config, research).is_err());
+        }
+        assert!(MultiPortfolio::new_for_smt_research(vec![metadata("BTCUSDT")?],
+            PaperConfig::default().with_leverage(10)?, research).is_err());
         Ok(())
     }
 

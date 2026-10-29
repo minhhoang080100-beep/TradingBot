@@ -87,16 +87,15 @@ Giữ volume `/data`, một instance và chính sách restart được mô tả 
 
 Sao lưu log phiên cũ; rollout tạo phiên 100 USDT mới, không tự chuyển số dư/vị thế đang có. Code mới và Variables chỉ có hiệu lực trên deployment tương ứng; việc viết code cục bộ không thay đổi service đang chạy.
 
-### Kiểm chứng hiện tại (29/10/2026)
+### Kiểm chứng nghiên cứu SMT (29/10/2026)
 
 Trên Rust 1.89 native Windows/MSVC:
 
-- **547 test all-features**: 444 thư viện + 79 CLI paper + 10 backtest + 14 collector/recovery.
-- **441 test no-default-features**: 338 thư viện + 79 CLI paper + 10 backtest + 14 collector/recovery.
-- Clippy `--all-targets ... -- -D warnings` đạt ở cả hai cấu hình. Test entry-v2 kiểm tra intent chờ tại xác nhận FVG, khớp ở nến sau, trì hoãn một nến, giữ policy qua warmup/chuyển quyền quản lý setup và tương thích dữ liệu/hash risk của legacy.
-- Trên dataset 29/09–29/10, cả 10 cấu hình legacy giữ nguyên metrics, snapshot cuối, trade events và daily marks so với `evaluation-integrity.json`: 20 tổ hợp cấu hình/phần thời gian được đối chiếu. Kết quả entry-v2 nằm trong hai báo cáo version 3 được mô tả bên dưới.
-- Release cả ba binary đạt; smoke public BTC/ETH 75 giây, 500 batch warmup + một batch live, Telegram tắt, dừng đúng `duration_elapsed`, tài sản 100 USDT; replay V1/V2/V3/V4 và phiên smoke giữ SHA-256 tương ứng. Hồ sơ: `paper-runs/verification-20261029-entry-v2-report.json`.
-- Hai báo cáo nghiên cứu lặp lại giống nhau từng byte; 199 kiểm tra cấu hình, hạch toán, tương thích legacy và tái lập đạt. Chi tiết: `paper-runs/entry-v2-research-verification.txt`.
+- **573 test all-features**: 467 thư viện + 79 CLI paper + 13 backtest + 14 collector/recovery.
+- **467 test no-default-features**: 361 thư viện + 79 CLI paper + 13 backtest + 14 collector/recovery.
+- Clippy `--all-targets ... -- -D warnings` đạt ở cả hai cấu hình; release cả ba binary đạt. Test bao phủ SMT hai chiều, dữ liệu đồng bộ, swing đã bị tiêu thụ, ghép đúng mô hình fractal, cấm dùng M5 chưa đóng, gate admission theo đúng bằng chứng, warmup và thứ tự xử lý khớp/hủy.
+- Smoke public BTC/ETH 75 giây có 500 batch warmup + hai batch live, Telegram tắt, dừng đúng `duration_elapsed`, tài sản 100 USDT và không có vị thế. Replay V1/V2/V3/V4 và phiên smoke giữ SHA-256 tương ứng. Hồ sơ: `paper-runs/verification-20261029-smt-report.json`.
+- Kiểm tra độc lập trên hai báo cáo SMT đạt **48.299 phép kiểm tra**, gồm **1.482 bằng chứng admission** qua các cấu hình/giai đoạn; đây không phải 1.482 giao dịch độc lập vì các kịch bản dùng chung dữ liệu. RR ròng thấp nhất tính lại từ order được nhận là **2,00063416**. Hai báo cáo chạy lặp lại giống nhau từng byte; 18 cấu hình cũ giữ nguyên metrics, snapshot, trade events và daily marks. Kiểm tra hướng và thời điểm M5 ghi nhận không thay thế một bản dựng lại toàn bộ state machine M5 độc lập. Chi tiết: `paper-runs/smt-research-verification.txt`. Có thể chạy lại bằng `python scripts/verify_smt_research.py` khi có đủ hai dataset, báo cáo SMT và các báo cáo Entry V2 nền tại những đường dẫn bên dưới; script chỉ đọc và dùng `Decimal`, không truy cập mạng.
 
 Kiểm thử bao phủ giới hạn vốn/rủi ro/nhiều lệnh, entry 24/7 và killzone, retry/stale/deadline, thống kê setup, Telegram bốn lệnh dưới giới hạn 4.096 ký tự, dataset liên tục, phân tách thời gian và phí/PnL. Đây là kiểm chứng phần mềm cục bộ; không chứng minh lợi nhuận, độ trễ khớp lệnh hay bản triển khai Railway đã được cập nhật. Không gửi Telegram thử trong bộ kiểm tra.
 
@@ -106,6 +105,56 @@ CLI portfolio mặc định `always`; `MultiPortfolio::new` của thư viện v�
 
 `paper_history` thu thập nến public Bybit BTCUSDT/ETHUSDT M1 và metadata hiện tại. `paper_backtest` đọc dataset đã lưu, không gọi sàn/Telegram và không thay đổi bot đang chạy. Cả hai từ chối ghi đè đầu ra; chọn thư mục/file mới cho mỗi lần thực hiện.
 
+#### Nghiên cứu SMT BTC–ETH bắt buộc
+
+Yêu cầu nghiên cứu mới là **SMT BTC–ETH bắt buộc**, **RR sau phí và giả định trượt giá SL tối thiểu 1:2**, với mục tiêu trung bình **hơn 10 entry đã khớp mỗi ngày cho tổng danh mục BTC+ETH**. Số đề xuất hoặc limit mới đặt không được tính là lệnh khớp. Báo cáo đo số khớp trên thời gian quan sát thực tế, số khớp từng ngày kể cả ngày bằng không, số ngày trên 10 lệnh, số lệnh đã đóng và thời gian giữ vị thế. Đạt trung bình trên 10 không có nghĩa mọi ngày đều trên 10; mục tiêu tần suất không cho phép bỏ điều kiện SMT, RR hoặc hạn mức tài khoản.
+
+Giữ tổng vốn paper **100 USDT dùng chung**, đòn bẩy mô phỏng **x10**, risk tối đa **1% mỗi lệnh / 3% tổng**, tối đa **bốn lệnh đang chờ hoặc đang mở / hai lệnh mỗi cặp**, circuit breaker drawdown ngày **5%**. TP vẫn lấy từ thanh khoản đối diện đã xác nhận và chưa bị quét, xét mục tiêu tiếp theo chỉ khi cần đáp ứng RR. Không tự tạo một mức TP tùy ý để ép lệnh vượt kiểm tra.
+
+Evaluator hiện khai báo **34 cấu hình cố định**: giữ 18 cấu hình trước, thêm 16 cấu hình `smt_*` theo tích bốn lựa chọn:
+
+| Thành phần | Hai lựa chọn được so sánh |
+| --- | --- |
+| Swing M1 cho cả BTC và ETH | Fractal 3 nến / 5 nến |
+| Hướng M5 tại lúc nhận lệnh | Không yêu cầu / bắt buộc cùng hướng |
+| Phí mỗi chiều và slippage SL | 6/2 bps / 10/5 bps |
+| Khớp entry | Có thể từ nến kế tiếp / bỏ qua nến hợp lệ đầu tiên |
+
+Mỗi cấu hình SMT vẫn yêu cầu **sweep hợp lệ → MSS và displacement M1 thật → FVG ở nến kế tiếp → limit tại 50% FVG**. Biến thể cùng hướng M5 là giả thuyết bắt nhịp hồi M1 trong hướng cấu trúc M5; không biến tín hiệu BOS M1 thành MSS và không vào trực tiếp chỉ vì có BOS. Các cấu hình chạy 24/7, dùng TP `nearest_viable`; các hạn mức rủi ro không được tối ưu trong phép thử này.
+
+Quy tắc SMT được cố định trước khi đánh giá:
+
+- Cả hai nến M1 phải đóng, liên tục và cùng khoảng UTC. Phân tích cả BTC và ETH xong mới xét phân kỳ hoặc cho phép nhận lệnh; không dùng nến hiện tại của một cặp với nến cũ của cặp kia.
+- Cặp chủ thể quét đỉnh/đáy bằng wick rồi đóng trở lại phía ban đầu. Cặp còn lại không phá mức đỉnh/đáy tương ứng. Long dùng quét đáy; short dùng quét đỉnh. Không suy ra việc giữ mức của cặp còn lại chỉ từ việc thiếu một sự kiện sweep.
+- Hai swing tham chiếu phải được xác nhận chậm nhất tại **giờ mở nến sweep**, cùng loại đỉnh/đáy và cùng mô hình fractal; chênh giờ tạo swing tối đa **ba phút**, tuổi swing tối đa **60 phút**. Swing của cặp đối chiếu được chọn theo khoảng cách thời gian gần nhất trước khi kiểm tra mức giá. Nếu swing được chọn đã bị phá, khác mô hình hoặc không còn hợp lệ, không thử một swing xa hơn cho tới khi tìm được phân kỳ thuận ý. Nhiều swing chủ thể cùng giá nhưng không phân biệt được danh tính cũng bị loại.
+- Bất kỳ wick phá mức nào cũng tiêu thụ thanh khoản tham chiếu, kể cả không đóng trở lại. Cả hai cặp cùng phá các mức tương ứng không tạo SMT. Nếu xuất hiện đồng thời bằng chứng SMT mới ngược hướng trong cùng batch, không xác nhận các bằng chứng mới đó.
+- Bằng chứng SMT giữ nguyên hai swing và hai nến nguồn, hết hiệu lực sau **12 phút từ lúc xác nhận**, hoặc sớm hơn khi cặp đối chiếu phá mức đã giữ hay chủ thể phá cực trị sweep gốc. Tại nhận lệnh, bot phải tìm đúng bằng chứng còn hiệu lực cho **ID sweep của intent**, đúng cặp và hướng; chỉ trùng hướng với một SMT khác không đủ.
+
+M5 được ghép từ đúng năm nến M1 đã đóng liên tục theo biên UTC; bỏ đoạn năm phút đầu nếu dữ liệu bắt đầu giữa đoạn. Detector M5 dùng fractal 5 nến và BOS/MSS xác nhận theo giá đóng. Hướng trước đó giữ nguyên trong bốn nến M1 đầu, chỉ được cập nhật ở lần đóng nến M1 thứ năm. Điều kiện cùng hướng M5 được kiểm tra **tại lúc nhận lệnh**; M5 đổi hướng về sau không tự hủy limit. Việc chỉ dùng dữ liệu khung lớn đã xác nhận nhằm tránh thay đổi kết quả vì nến khung lớn còn đang hình thành, một nguyên nhân repainting được mô tả trong [tài liệu TradingView](https://www.tradingview.com/pine-script-docs/concepts/repainting/).
+
+Broker xử lý OHLC của nến hiện tại trước khi xét SMT mất hiệu lực tại giờ đóng nến. Sau đó chỉ hủy những entry **vẫn chưa khớp** nếu bằng chứng SMT bị mất; không dùng thông tin ở cuối nến để xóa ngược một giao dịch có thể đã khớp trong chính nến đó. Bằng chứng xuất ra cho mỗi admission gồm intent MSS/FVG gốc, swing và nến SMT đã đóng băng, nến cặp đối chiếu tại admission, hướng/thời điểm M5 đã biết và order thực sự được book nhận. Warmup chỉ khởi tạo ngữ cảnh, không đặt lệnh lịch sử hay tăng số SMT live.
+
+Đã chạy đủ 34 cấu hình trên hai dataset, mỗi dataset chia thành 23 ngày phát triển và bảy ngày cuối kỳ với **100 USDT độc lập cho từng phần/cấu hình**. Mỗi ô dưới đây là **số entry đã khớp trung bình/ngày / thay đổi tài sản sau phí (USDT)**, làm tròn bốn chữ số. Không cộng PnL giữa các cột thành một tài khoản liên tục. Mọi phân đoạn SMT đều kết thúc không còn vị thế hoặc lệnh chờ; ở các phân đoạn này số khớp bằng số lệnh đã đóng.
+
+| Cấu hình SMT | 30/08–22/09 phát triển | 22/09–29/09 cuối kỳ | 29/09–22/10 phát triển | 22/10–29/10 cuối kỳ |
+| --- | ---: | ---: | ---: | ---: |
+| `smt_f3_base` | 2.0870 / −20.1025 | 1.7143 / −4.8264 | 2.3478 / −12.7562 | 1.8571 / +3.1981 |
+| `smt_f3_stressed_costs` | 1.9130 / −27.9396 | 1.7143 / −7.2082 | 2.1739 / −24.3100 | 1.5714 / +1.7215 |
+| `smt_f5_base` | 0.5217 / −1.7894 | 0.4286 / −2.6883 | 0.6522 / −7.2829 | 0.4286 / +0.2858 |
+| `smt_f3_m5_aligned_base` | 0.8696 / −3.1381 | 0.5714 / −3.6628 | 1.0000 / −5.9972 | 0.5714 / +2.5906 |
+
+Trong tất cả 16 cấu hình SMT trên bốn phân đoạn, **chưa cấu hình/phân đoạn nào đạt trung bình hơn 10 entry khớp/ngày**. Cao nhất là `smt_f3_base` ở phần phát triển gần nhất: **54 khớp / 23 ngày = 2,3478 khớp/ngày**, PnL **−12,7562 USDT**; cùng cấu hình ở phần phát triển tháng trước có **48 khớp / 23 ngày**, PnL **−20,1025 USDT**. Cả 16 cấu hình đều âm ở hai phần phát triển. Một số phần cuối kỳ tháng sau dương với số lệnh nhỏ; các giai đoạn này đã được xem ở nghiên cứu trước, nên không phải kiểm chứng mới độc lập.
+
+Luồng quan sát của `smt_f3_base` trong 23 ngày gần nhất là **2.516 SMT thô → 101 intent → 85 limit được nhận → 54 lần khớp**. Chuỗi MSS/displacement/FVG sau SMT chỉ tạo khoảng 4,39 intent/ngày trước khi qua quản lý rủi ro. Vì vậy nút thắt tần suất trong phép thử này nằm chủ yếu ở chuỗi xác nhận setup và chờ khớp; bốn cấu hình base được so sánh không có lần từ chối do trần số lệnh hoặc tổng risk. SMT thô có thể gồm nhiều mức bị quét, không phải 2.516 setup độc lập hoàn chỉnh. Ngày có nhiều lần khớp nhất trong toàn bộ 64 phân đoạn SMT cũng chỉ có sáu lần; tăng giới hạn risk không được chứng minh là cách đạt mục tiêu.
+
+Kết quả cho thấy các thử nghiệm hiện tại đáp ứng gate SMT và RR ước tính khi nhận lệnh, nhưng **chưa đạt mục tiêu tần suất và chưa xác lập lợi thế có lợi nhuận**. Đây là kết luận về các cấu hình/dữ liệu đã thử, không phải chứng minh mọi chiến lược SMT đều không thể đạt hơn 10 lệnh/ngày. Chưa chọn cấu hình để triển khai. Nghiên cứu chỉ có trong evaluator offline; chưa có tùy chọn kích hoạt trên runner Railway hoặc journal V1–V4.
+
+Báo cáo `report_version=4` được lưu tại `paper-runs/research-20261029-30d/evaluation-smt.json` (SHA-256 `6a0d899730d627ff9b285cd44c219e244a0511a7f61aed96dfb4f1f9c862db7b`) và `paper-runs/research-20261029-entry-v2-prior30d/evaluation-smt.json` (SHA-256 `4436b5059451afa1d35bb9bcc17975a56c22ad0c99d0c44f2dd8fcae394c9271`). Cấu hình đầy đủ, số liệu chưa làm tròn, tần suất theo ngày và bằng chứng admission nằm trong hai file. Các số liệu Entry V2 bên dưới là bằng chứng cũ, không phải kết quả của 16 cấu hình SMT.
+
+RR ròng hiện tính theo phí giao dịch và slippage SL của từng kịch bản, **chưa tính funding**. Vị thế perpetual giữ đúng thời điểm funding có thể trả hoặc nhận funding; chu kỳ phụ thuộc cặp và có thể thay đổi theo cơ chế của sàn. Do đó kết quả chưa mô phỏng funding không phải lợi nhuận ròng đầy đủ của futures thực. [Bybit: Funding Fee Calculation](https://www.bybit.com/en/help-center/article/Funding-fee-calculation).
+
+#### Nghiên cứu Entry V2 trước khi bổ sung SMT
+
 ```powershell
 # 500 nến warmup trước cửa sổ đánh giá 29/09–29/10/2026 UTC:
 cargo run --locked --release --no-default-features --bin paper_history -- --start 2026-09-28T15:40:00Z --end 2026-10-29T00:00:00Z --output paper-runs/research-30d-new
@@ -114,7 +163,7 @@ cargo run --locked --release --no-default-features --bin paper_backtest -- --dat
 
 Dataset đã thu thập tại `paper-runs/research-20261029-30d/`: **43.700 nến mỗi cặp**, gồm 500 nến warmup và 30 ngày đánh giá `[29/09/2026 00:00, 29/10/2026 00:00)` UTC. Chia theo thời gian thành 23 ngày phát triển và 7 ngày kiểm tra sau cùng (holdout). Mỗi phần có tài khoản 100 USDT độc lập và chỉ warmup bằng 500 nến trước nó; không cộng dồn lợi nhuận của hai phần.
 
-Báo cáo entry-v2 dùng `report_version=3` với **18 cấu hình cố định**. Giữ nguyên 10 cấu hình của version 2: sáu cấu hình cũ (`always`/`killzones` hiện tại và TP nghiên cứu `nearest_viable`, mỗi loại ở hai mức chi phí), cộng bốn cấu hình `always` hiện tại/`nearest_viable` ở hai mức chi phí nhưng bỏ qua nến entry hợp lệ đầu tiên. Thêm tám cấu hình `entry_v2_*`, đều `always`, kết hợp hai cách chọn TP (`nearest`/`nearest_viable`), hai mức chi phí (phí mỗi chiều/stop slippage **6/2** hoặc **10/5 bps**) và hai cách tính thời điểm khớp (nến sau hoặc bỏ qua nến hợp lệ đầu tiên).
+Báo cáo entry-v2 trước SMT dùng `report_version=3` với **18 cấu hình cố định**. Giữ nguyên 10 cấu hình của version 2: sáu cấu hình cũ (`always`/`killzones` hiện tại và TP nghiên cứu `nearest_viable`, mỗi loại ở hai mức chi phí), cộng bốn cấu hình `always` hiện tại/`nearest_viable` ở hai mức chi phí nhưng bỏ qua nến entry hợp lệ đầu tiên. Thêm tám cấu hình `entry_v2_*`, đều `always`, kết hợp hai cách chọn TP (`nearest`/`nearest_viable`), hai mức chi phí (phí mỗi chiều/stop slippage **6/2** hoặc **10/5 bps**) và hai cách tính thời điểm khớp (nến sau hoặc bỏ qua nến hợp lệ đầu tiên).
 
 Entry-v2 là giả thuyết nghiên cứu `resting_on_confirmation`, thay đổi cách hình thành lệnh chờ:
 

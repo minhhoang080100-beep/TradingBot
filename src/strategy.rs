@@ -10,7 +10,7 @@
 //! policy instead places its limit when the FVG is confirmed; neither policy
 //! treats the decision candle as an execution fill.
 
-use std::{collections::HashMap, num::NonZeroU16, time::Duration as StdDuration};
+use std::{collections::{BTreeSet, HashMap}, num::NonZeroU16, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
@@ -562,6 +562,28 @@ impl StrategyEngine {
         }
     }
 
+    /// Processes an observation while accepting only explicitly eligible sweeps.
+    ///
+    /// Research confluence filters may withhold new sweep candidates without
+    /// removing ICT observations, suppressing ambiguity checks, or changing an
+    /// existing owner's FVG, expiry, cancellation, or execution lifecycle.
+    /// The ordinary [`Self::process_event`] path accepts every validated sweep.
+    ///
+    /// # Errors
+    /// Returns [`StrategyError`] for an internal model/timestamp failure.
+    pub fn process_event_with_sweep_filter(
+        &mut self,
+        event: IctEngineEvent,
+        allowed_sweep_ids: &BTreeSet<Uuid>,
+    ) -> Result<Vec<StrategyAction>, StrategyError> {
+        match event {
+            IctEngineEvent::CandleAnalyzed { candle, batch } => {
+                self.process_analyzed_candle_with_sweep_filter(&candle, &batch, Some(allowed_sweep_ids))
+            }
+            event => self.process_event(event),
+        }
+    }
+
     /// Processes an ICT or explicit execution-lifecycle command.
     ///
     /// # Errors
@@ -714,6 +736,15 @@ impl StrategyEngine {
         candle: &Candle,
         batch: &IctDetectionBatch,
     ) -> Result<Vec<StrategyAction>, StrategyError> {
+        self.process_analyzed_candle_with_sweep_filter(candle, batch, None)
+    }
+
+    fn process_analyzed_candle_with_sweep_filter(
+        &mut self,
+        candle: &Candle,
+        batch: &IctDetectionBatch,
+        allowed_sweep_ids: Option<&BTreeSet<Uuid>>,
+    ) -> Result<Vec<StrategyAction>, StrategyError> {
         if batch.is_duplicate() {
             return Ok(Vec::new());
         }
@@ -774,7 +805,7 @@ impl StrategyEngine {
 
         accept_sweep(
             &mut state,
-            normalized.sweep.clone(),
+            normalized.sweep.clone().filter(|sweep| allowed_sweep_ids.is_none_or(|ids| ids.contains(&sweep.id()))),
             &key,
             candle.close_time(),
             &mut actions,
@@ -1890,6 +1921,83 @@ mod tests {
         let confirmation = candle(3, 110, 115, 112)?;
         let batch = detector.process_candle(&confirmation)?;
         Ok((confirmation, batch))
+    }
+
+    fn detected_sweep_batch() -> Result<(Candle, IctDetectionBatch, Uuid), Box<dyn Error>> {
+        let mut detector = IctEngine::new(IctEngineConfig::default());
+        for (minute, (low, high, close)) in [(100, 110, 105), (100, 112, 105),
+            (95, 111, 100), (100, 110, 105), (100, 110, 105)].into_iter().enumerate() {
+            detector.process_candle(&candle(i64::try_from(minute)?, low, high, close)?)?;
+        }
+        let sweep_candle = candle(5, 94, 110, 100)?;
+        let batch = detector.process_candle(&sweep_candle)?;
+        let id = batch.signals().iter().find_map(|event| match event {
+            SignalEvent::LiquiditySwept(sweep) => Some(sweep.id()),
+            _ => None,
+        }).ok_or("missing real sweep")?;
+        Ok((sweep_candle, batch, id))
+    }
+
+    #[test]
+    fn eligibility_filter_admits_real_sweeps_only_when_explicitly_allowed() -> TestResult {
+        let key = key_for(instrument()?);
+        let (candle, batch, id) = detected_sweep_batch()?;
+        let event = IctEngineEvent::CandleAnalyzed { candle, batch };
+        let config = strategy_config(FvgEntryMode::ConsequentEncroachment, 12);
+        let mut filtered = StrategyEngine::new(config);
+        let mut ordinary = StrategyEngine::new(config);
+        let mut denied = StrategyEngine::new(config);
+        let allowed = BTreeSet::from([id]);
+        assert_eq!(filtered.process_event_with_sweep_filter(event.clone(), &allowed)?,
+            ordinary.process_event(event.clone())?);
+        denied.process_event_with_sweep_filter(event, &BTreeSet::new())?;
+        assert_eq!(filtered.stage(&key), StrategyStage::WaitingForMss);
+        assert_eq!(ordinary.stage(&key), StrategyStage::WaitingForMss);
+        assert_eq!(denied.stage(&key), StrategyStage::WaitingForSweep);
+        Ok(())
+    }
+
+    #[test]
+    fn ineligible_new_sweep_cannot_replace_a_retained_setup() -> TestResult {
+        let key = key_for(instrument()?);
+        let original = fixture_sweep()?;
+        let original_id = original.id();
+        let mut engine = StrategyEngine::new(strategy_config(FvgEntryMode::ConsequentEncroachment, 12));
+        engine.series.insert(key.clone(), SeriesState { phase: SeriesPhase::Swept(PendingSweep {
+            sweep: original, direction: Direction::Bullish, age_bars: 2,
+        }), ..SeriesState::default() });
+        let (candle, batch, _) = detected_sweep_batch()?;
+        let actions = engine.process_event_with_sweep_filter(
+            IctEngineEvent::CandleAnalyzed { candle, batch }, &BTreeSet::new())?;
+        assert!(!actions.iter().any(|action| matches!(action, StrategyAction::SetupDiscarded {
+            reason: SetupDiscardReason::SupersededByNewSweep, .. })));
+        assert!(matches!(engine.series.get(&key).map(|state| &state.phase),
+            Some(SeriesPhase::Swept(sweep)) if sweep.sweep.id() == original_id && sweep.age_bars == 3));
+        Ok(())
+    }
+
+    #[test]
+    fn sweep_filter_does_not_block_pending_owner_or_execution_lifecycle() -> TestResult {
+        let key = key_for(instrument()?);
+        let intent = fixture_intent(FvgEntryMode::ConsequentEncroachment)?;
+        let config = strategy_config(FvgEntryMode::ConsequentEncroachment, 12);
+        let mut filtered = StrategyEngine::new(config);
+        let mut ordinary = StrategyEngine::new(config);
+        filtered.series.insert(key.clone(), state_with_pending(intent.clone()));
+        ordinary.series.insert(key.clone(), state_with_pending(intent.clone()));
+        let candle = candle(5, 106, 120, 111)?;
+        let batch = empty_batch(&candle)?;
+        let event = IctEngineEvent::CandleAnalyzed { candle, batch };
+        assert_eq!(filtered.process_event_with_sweep_filter(event.clone(), &BTreeSet::new())?, ordinary.process_event(event)?);
+        for command in [
+            StrategyCommand::EntryFilled { key: key.clone(), intent_id: intent.id(), filled_at: at_minute(7)? },
+            StrategyCommand::PositionClosed { key: key.clone(), intent_id: intent.id(), closed_at: at_minute(8)? },
+        ] {
+            assert_eq!(filtered.process_command(command.clone())?, ordinary.process_command(command)?);
+        }
+        assert_eq!(filtered.state(&key), StrategyState::Idle);
+        assert_eq!(filtered.state(&key), ordinary.state(&key));
+        Ok(())
     }
 
     fn state_with_impulse() -> Result<SeriesState, Box<dyn Error>> {

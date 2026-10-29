@@ -19,6 +19,7 @@ pub mod paper;
 pub mod reconciliation;
 pub mod risk;
 pub mod strategy;
+pub mod smt;
 pub mod telegram;
 
 pub use candle_store::{
