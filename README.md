@@ -91,11 +91,12 @@ Sao lưu log phiên cũ; rollout tạo phiên 100 USDT mới, không tự chuy�
 
 Trên Rust 1.89 native Windows/MSVC:
 
-- **531 test all-features**: 429 thư viện + 79 CLI paper + 9 backtest + 14 collector/recovery.
-- **425 test no-default-features**: 323 thư viện + 79 CLI paper + 9 backtest + 14 collector/recovery.
-- Clippy `--all-targets ... -- -D warnings` đạt ở cả hai cấu hình. Test mới kiểm tra chẩn đoán admission không làm đổi kết quả, trì hoãn entry không làm sai phí/expiry/protective exit và journal không ghi summary giả sau lỗi commit.
-- Release `--no-default-features` của cả ba binary `paper`, `paper_history`, `paper_backtest` build đạt. Báo cáo `evaluation-integrity.json` (version 2) lặp lại giống nhau từng byte; metrics, snapshot cuối, trade events và daily marks của sáu cấu hình cũ giữ nguyên so với báo cáo trước.
-- Smoke release public BTC/ETH 75 giây có 500 batch warmup + một batch live, `poll=60`/heartbeat 60 giây và Telegram tắt: dừng đúng `duration_elapsed`, tài sản 100 USDT. Replay V1/V2/V3/V4 và log smoke mới giữ SHA-256 tương ứng. Bằng chứng: `paper-runs/verification-20261029-integrity-report.json`.
+- **547 test all-features**: 444 thư viện + 79 CLI paper + 10 backtest + 14 collector/recovery.
+- **441 test no-default-features**: 338 thư viện + 79 CLI paper + 10 backtest + 14 collector/recovery.
+- Clippy `--all-targets ... -- -D warnings` đạt ở cả hai cấu hình. Test entry-v2 kiểm tra intent chờ tại xác nhận FVG, khớp ở nến sau, trì hoãn một nến, giữ policy qua warmup/chuyển quyền quản lý setup và tương thích dữ liệu/hash risk của legacy.
+- Trên dataset 29/09–29/10, cả 10 cấu hình legacy giữ nguyên metrics, snapshot cuối, trade events và daily marks so với `evaluation-integrity.json`: 20 tổ hợp cấu hình/phần thời gian được đối chiếu. Kết quả entry-v2 nằm trong hai báo cáo version 3 được mô tả bên dưới.
+- Release cả ba binary đạt; smoke public BTC/ETH 75 giây, 500 batch warmup + một batch live, Telegram tắt, dừng đúng `duration_elapsed`, tài sản 100 USDT; replay V1/V2/V3/V4 và phiên smoke giữ SHA-256 tương ứng. Hồ sơ: `paper-runs/verification-20261029-entry-v2-report.json`.
+- Hai báo cáo nghiên cứu lặp lại giống nhau từng byte; 199 kiểm tra cấu hình, hạch toán, tương thích legacy và tái lập đạt. Chi tiết: `paper-runs/entry-v2-research-verification.txt`.
 
 Kiểm thử bao phủ giới hạn vốn/rủi ro/nhiều lệnh, entry 24/7 và killzone, retry/stale/deadline, thống kê setup, Telegram bốn lệnh dưới giới hạn 4.096 ký tự, dataset liên tục, phân tách thời gian và phí/PnL. Đây là kiểm chứng phần mềm cục bộ; không chứng minh lợi nhuận, độ trễ khớp lệnh hay bản triển khai Railway đã được cập nhật. Không gửi Telegram thử trong bộ kiểm tra.
 
@@ -113,23 +114,41 @@ cargo run --locked --release --no-default-features --bin paper_backtest -- --dat
 
 Dataset đã thu thập tại `paper-runs/research-20261029-30d/`: **43.700 nến mỗi cặp**, gồm 500 nến warmup và 30 ngày đánh giá `[29/09/2026 00:00, 29/10/2026 00:00)` UTC. Chia theo thời gian thành 23 ngày phát triển và 7 ngày kiểm tra sau cùng (holdout). Mỗi phần có tài khoản 100 USDT độc lập và chỉ warmup bằng 500 nến trước nó; không cộng dồn lợi nhuận của hai phần.
 
-Báo cáo mới dùng `report_version=2` với **10 cấu hình cố định**: sáu cấu hình cũ (`always`/`killzones` hiện tại và TP nghiên cứu `nearest_viable`, mỗi loại ở hai mức chi phí), thêm bốn cấu hình `always` hiện tại/`nearest_viable` ở hai mức chi phí nhưng không cho entry khớp trong nến hợp lệ đầu tiên. Quy tắc trì hoãn đúng một nến này chỉ là phép thử độ nhạy: không thay expiry hoặc protective exit, không tái tạo độ trễ thời gian thực hay giá trong thời gian xử lý bù dữ liệu, và không bảo đảm tạo ra cận dưới của PnL.
+Báo cáo entry-v2 dùng `report_version=3` với **18 cấu hình cố định**. Giữ nguyên 10 cấu hình của version 2: sáu cấu hình cũ (`always`/`killzones` hiện tại và TP nghiên cứu `nearest_viable`, mỗi loại ở hai mức chi phí), cộng bốn cấu hình `always` hiện tại/`nearest_viable` ở hai mức chi phí nhưng bỏ qua nến entry hợp lệ đầu tiên. Thêm tám cấu hình `entry_v2_*`, đều `always`, kết hợp hai cách chọn TP (`nearest`/`nearest_viable`), hai mức chi phí (phí mỗi chiều/stop slippage **6/2** hoặc **10/5 bps**) và hai cách tính thời điểm khớp (nến sau hoặc bỏ qua nến hợp lệ đầu tiên).
 
-Giả thuyết `nearest_viable` xét mục tiêu thanh khoản đối diện đã xác nhận tiếp theo chỉ khi mục tiêu gần nhất không đạt RR trước/sau chi phí; không thử mục tiêu xa hơn để vượt lỗi thiếu vốn, khối lượng hoặc số lệnh. Vẫn giữ setup, x10, risk 1%/3%, giới hạn 4/2 lệnh và net RR ≥ 2. **TP nghiên cứu và trì hoãn một nến chưa được áp dụng vào runner đang chạy; V1–V4 vẫn replay theo quy tắc cũ.**
+Entry-v2 là giả thuyết nghiên cứu `resting_on_confirmation`, thay đổi cách hình thành lệnh chờ:
 
-Kết quả ngày 29/10/2026 trong `paper-runs/research-20261029-30d/evaluation-integrity.json` dưới đây là thay đổi **tổng tài sản sau phí, đơn vị USDT**, không phải lợi nhuận tiền thật:
+- Cách cũ `legacy_retracement` chờ một nến đóng đã chạm 50% FVG (Consequent Encroachment, CE), sau đó mới tạo intent và đợi giá đi qua entry ở nến sau. Entry-v2 tạo intent LIMIT tại CE ngay lúc nến thứ ba xác nhận FVG đóng; giá LIMIT phải nằm phía thụ động so với giá đóng xác nhận. Việc tạo intent vẫn phải qua kiểm tra vốn, rủi ro và RR trước khi broker paper nhận lệnh.
+- Giữ ngữ cảnh sweep đã có MSS/displacement hợp lệ khi xuất hiện sweep mới, thay vì thay setup đang chờ FVG. Nếu nến sau phá cực trị sweep gốc (low thấp hơn với long, high cao hơn với short), setup bị hủy. Vẫn giữ giới hạn tuổi setup tính từ sweep; không gia hạn lại khi có MSS.
+- FVG phải hình thành ngay ở nến kế tiếp sau MSS, với nến displacement xác nhận MSS là nến giữa của FVG. Không mở rộng cửa sổ FVG hoặc bỏ kiểm tra thứ tự thời gian. Không ghi nhận khớp trên chính nến tạo FVG; các nến sau vẫn phải đi qua giá entry theo quy tắc broker paper.
 
-| Cấu hình 24/7 | Phát triển: số lệnh đóng / thay đổi tài sản | Holdout: số lệnh đóng / thay đổi tài sản |
-| --- | ---: | ---: |
-| Hiện tại, phí 6 bps mỗi chiều + stop slippage 2 bps | 1 lệnh lỗ / −0.95922440 | 0 / 0 |
-| Nghiên cứu `nearest_viable`, chi phí 6/2 bps | 50 / −17.69644042 | 10 / +6.6100374 |
-| Nghiên cứu `nearest_viable`, chi phí tăng lên 10/5 bps | 47 / −25.3356977 | 9 / +0.6855311 |
-| `nearest_viable`, bỏ nến entry đầu, chi phí 6/2 bps | 35 / −17.84982808 | 9 / +7.5676482 |
-| `nearest_viable`, bỏ nến entry đầu, chi phí 10/5 bps | 33 / −20.3817326 | 8 / +1.5262145 |
+Trì hoãn đúng một nến là phép thử độ nhạy riêng: không thay expiry hoặc protective exit, không tái tạo độ trễ thời gian thực hay giá trong thời gian xử lý bù dữ liệu, và không bảo đảm tạo ra cận dưới của PnL. Tám cấu hình mới kiểm tra chung chính sách tạo lệnh tại xác nhận và giữ ngữ cảnh MSS; chưa tách riêng tác động của hai thay đổi này.
 
-Hai holdout `nearest_viable` mức phí 6/2 đều còn **một vị thế mở**: +6.6100374 và +7.5676482 bao gồm định giá vị thế theo nến cuối, không phải toàn bộ lãi đã chốt. Cấu hình hiện tại khi trì hoãn entry vẫn có một lệnh lỗ ở tập phát triển và không có lệnh ở holdout; các cấu hình killzone và cấu hình hiện tại với chi phí tăng không có giao dịch trong mẫu này.
+Giả thuyết `nearest_viable` xét mục tiêu thanh khoản đối diện đã xác nhận tiếp theo chỉ khi mục tiêu gần nhất không đạt RR trước/sau chi phí; không thử mục tiêu xa hơn để vượt lỗi thiếu vốn, khối lượng hoặc số lệnh. Mọi cấu hình giữ vốn 100 USDT, x10, risk tối đa 1% mỗi lệnh/3% tổng, tối đa bốn lệnh (hai mỗi cặp), drawdown ngày 5% và net RR ≥ 2. **Entry-v2, TP nghiên cứu và trì hoãn một nến chỉ được bật trong evaluator offline; runner và constructor mặc định giữ `legacy_retracement`, V1–V4 vẫn replay theo quy tắc cũ.**
 
-Chẩn đoán chính xác cho cấu hình hiện tại trong 30 ngày: **77 intent, 62 bị loại vì RR trước phí, 14 vì RR sau chi phí, chỉ một được nhận**. Vì vậy không quy chung mọi lần từ chối cho phí hoặc kết nối. Phương án TP xa hơn và trì hoãn entry vẫn thua lỗ đáng kể ở 23 ngày đầu; 7 ngày cuối chỉ có 8–10 lệnh đóng, kết quả nhạy với chi phí và còn exposure ở một số cấu hình. **Chưa chọn phương án nghiên cứu nào để triển khai.** Mọi báo cáo giữ trạng thái **`UNVALIDATED`**, không tự điều chỉnh hoặc thay chiến lược chạy trên Railway.
+Đã bổ sung dataset hồi cứu liền trước tại `paper-runs/research-20261029-entry-v2-prior30d/`: **43.700 nến mỗi cặp**, thu thập `[29/08/2026 15:40, 29/09/2026 00:00)` UTC. Sau 500 nến warmup, cửa sổ đánh giá là `[30/08/2026 00:00, 29/09/2026 00:00)`; chia tại **22/09/2026 00:00 UTC** thành 23 ngày và 7 ngày, mỗi phần bắt đầu bằng tài khoản 100 USDT riêng. `collection-verification.json` lưu kiểm tra số lượng, khoảng thời gian liên tục, cờ đóng nến và SHA-256. Hai cửa sổ đánh giá không chồng lấn; 500 nến cuối của dataset bổ sung trùng phần warmup của dataset tháng sau.
+
+```powershell
+# Chạy evaluator trên dataset bổ sung đã có; chọn tên output chưa tồn tại:
+cargo run --locked --release --no-default-features --bin paper_backtest -- --dataset paper-runs/research-20261029-entry-v2-prior30d/manifest.json --split-at 2026-09-22T00:00:00Z --output paper-runs/research-20261029-entry-v2-prior30d/evaluation-entry-v2-new.json
+```
+
+Đây là kiểm tra độ bền trên một giai đoạn quá khứ bổ sung, **không phải forward holdout mới** hoặc bằng chứng độc lập qua nhiều mùa thị trường.
+
+Kết quả version 3 ngày 29/10/2026 đọc từ `evaluation-entry-v2.json` trong mỗi thư mục dataset. Mỗi ô là **số lệnh đã đóng / thay đổi tổng tài sản sau phí (USDT, làm tròn bốn chữ số)**; `*` nghĩa là còn một vị thế mở và kết quả có phần định giá theo nến cuối. Mỗi cột bắt đầu lại với 100 USDT; không cộng chúng thành lợi nhuận liên tục.
+
+| Cấu hình 24/7 | 30/08–22/09 phát triển | 22/09–29/09 cuối kỳ | 29/09–22/10 phát triển | 22/10–29/10 cuối kỳ |
+| --- | ---: | ---: | ---: | ---: |
+| Legacy hiện tại, `nearest`, chi phí 6/2 | 0 / 0.0000 | 0 / 0.0000 | 1 / −0.9592 | 0 / 0.0000 |
+| Entry-v2 `nearest`, chi phí 6/2 | 1 / −0.9083 | 0 / 0.0000 | 0 / 0.0000 | 0 / 0.0000 |
+| Entry-v2 `nearest_viable`, chi phí 6/2 | 65 / −28.3739 | 16 / −6.9832* | 66 / −18.2177 | 18 / +0.4826* |
+| Entry-v2 `nearest_viable`, chi phí 10/5 | 63 / −32.6082 | 15 / −9.4128* | 63 / −27.1132 | 18 / −1.7097 |
+| Entry-v2 `nearest_viable`, bỏ nến entry đầu, chi phí 6/2 | 59 / −24.8679 | 14 / −5.3197* | 57 / −17.3899 | 17 / +1.1083* |
+| Entry-v2 `nearest_viable`, bỏ nến entry đầu, chi phí 10/5 | 57 / −29.5631 | 13 / −7.7735* | 54 / −25.6295 | 17 / −0.8310 |
+
+SHA-256 của báo cáo 29/09–29/10: `354a3610f52b271dd1fee2c6a5776bf0dc3bd06b1b7030fbd845faf1f3d92791`; báo cáo 30/08–29/09: `cc3d9f8249fcc68f2330a7499ca6098ff709026642a5ed89f592d9fcd4b21d95`. Các cấu hình còn lại và số liệu chưa làm tròn nằm trong hai file JSON; kết quả version 2 vẫn được giữ tại `evaluation-integrity.json`.
+
+Chẩn đoán legacy trong kỳ 29/09–29/10 vẫn là **77 intent, 62 bị loại vì RR trước phí, 14 vì RR sau chi phí, chỉ một được nhận**; không quy chung mọi lần từ chối cho phí hoặc kết nối. Entry-v2 `nearest` ở chi phí 6/2 tạo **158 intent nhưng không nhận lệnh nào**: 134 không đủ RR trước phí, 22 không đủ RR sau chi phí, hai không có thanh khoản đối diện hợp lệ. Vì vậy sửa thời điểm vào lệnh chưa giải quyết được nút thắt TP/risk. Chọn TP đủ RR tạo thêm lệnh nhưng cả bốn cấu hình `nearest_viable` đều lỗ đáng kể ở hai phần phát triển, và lỗ ở phần cuối kỳ tháng trước; kết quả dương nhỏ tháng sau chuyển âm khi tăng chi phí. **Chưa có cơ sở đưa entry-v2 lên runner đang chạy.** Mọi báo cáo giữ trạng thái **`UNVALIDATED`**, không tự điều chỉnh hoặc thay chiến lược trên Railway.
 
 Báo cáo lưu hash dataset, cấu hình và mã nguồn được biên dịch để đối chiếu. Các giới hạn khi đọc kết quả:
 

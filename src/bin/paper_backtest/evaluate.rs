@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, NaiveDate, Utc};
-use ict_trading_bot::{Candle, Timeframe,
+use ict_trading_bot::{Candle, Timeframe, strategy::StrategyEntryPolicy,
     paper::{BookOrderState, MultiPortfolio, MultiPortfolioSnapshot, MultiSymbolDiagnostics,
         PaperConfig, PaperEntryWindow, PaperEvent, PaperFillTiming, PaperTargetPolicy, PortfolioEvent}};
 use rust_decimal::Decimal;
@@ -22,19 +22,28 @@ struct Profile {
     stop_bps: u32,
     target: PaperTargetPolicy,
     fill_timing: PaperFillTiming,
+    entry: StrategyEntryPolicy,
 }
 
-const PROFILES: [Profile; 10] = [
-    Profile { name: "always_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
-    Profile { name: "always_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
-    Profile { name: "killzones_base", window: PaperEntryWindow::Killzones, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
-    Profile { name: "killzones_stressed_costs", window: PaperEntryWindow::Killzones, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar },
-    Profile { name: "research_nearest_viable_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar },
-    Profile { name: "research_nearest_viable_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar },
-    Profile { name: "always_delayed_one_bar_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
-    Profile { name: "always_delayed_one_bar_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
-    Profile { name: "research_nearest_viable_delayed_one_bar_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
-    Profile { name: "research_nearest_viable_delayed_one_bar_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar },
+const PROFILES: [Profile; 18] = [
+    Profile { name: "always_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "always_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "killzones_base", window: PaperEntryWindow::Killzones, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "killzones_stressed_costs", window: PaperEntryWindow::Killzones, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "research_nearest_viable_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "research_nearest_viable_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "always_delayed_one_bar_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "always_delayed_one_bar_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "research_nearest_viable_delayed_one_bar_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "research_nearest_viable_delayed_one_bar_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::LegacyRetracement },
+    Profile { name: "entry_v2_nearest_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
+    Profile { name: "entry_v2_nearest_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
+    Profile { name: "entry_v2_nearest_delayed_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
+    Profile { name: "entry_v2_nearest_delayed_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::Nearest, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
+    Profile { name: "entry_v2_viable_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
+    Profile { name: "entry_v2_viable_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::ImmediateNextBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
+    Profile { name: "entry_v2_viable_delayed_base", window: PaperEntryWindow::Always, fee_bps: 6, stop_bps: 2, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
+    Profile { name: "entry_v2_viable_delayed_stressed_costs", window: PaperEntryWindow::Always, fee_bps: 10, stop_bps: 5, target: PaperTargetPolicy::NearestViable, fill_timing: PaperFillTiming::SkipFirstEligibleBar, entry: StrategyEntryPolicy::RestingOnConfirmation },
 ];
 
 impl Profile {
@@ -50,7 +59,11 @@ impl Profile {
             "risk_per_trade": "0.01", "max_total_risk": "0.03", "daily_drawdown_limit": "0.05",
             "minimum_net_rr": "2", "max_active_orders": 4, "max_active_per_symbol": 2,
             "target_policy": self.target, "target_source": "confirmed_unswept_opposing_liquidity",
-            "entry_policy": "closed_candle_ce_touch_then_later_strict_trade_through",
+            "entry_policy": self.entry,
+            "entry_description": match self.entry {
+                StrategyEntryPolicy::LegacyRetracement => "closed_candle_ce_touch_then_later_strict_trade_through",
+                StrategyEntryPolicy::RestingOnConfirmation => "resting_ce_limit_at_confirmed_fvg_close_then_later_strict_trade_through",
+            },
             "fill_timing": self.fill_timing,
             "take_profit_on_fill_candle": false,
         })
@@ -189,7 +202,7 @@ fn diagnostic(row: &MultiSymbolDiagnostics) -> Value {
 fn segment(data: &Dataset, start: usize, end: usize, warmup: usize, profile: Profile,
     name: &str) -> Result<Value, BoxError> {
     if start < warmup || end <= start || end > data.series[0].len() { return Err("invalid evaluation segment".into()); }
-    let mut engine = MultiPortfolio::new_for_research_with_fill_timing(data.instruments.clone(), profile.config()?, Timeframe::M1, profile.window, profile.target, profile.fill_timing)?;
+    let mut engine = MultiPortfolio::new_for_research_with_entry_policy(data.instruments.clone(), profile.config()?, Timeframe::M1, profile.window, profile.target, profile.fill_timing, profile.entry)?;
     for index in start - warmup..start { engine.warm_up(&batch(data, index))?; }
     let mut metrics = Metrics::new();
     let mut ledger = Vec::new();
@@ -256,7 +269,7 @@ pub(super) fn report(data: &Dataset, split_at: DateTime<Utc>) -> Result<Value, B
     if split <= WARMUP || split >= first.len() { return Err("split needs nonempty development and holdout plus 500 warmup bars".into()); }
     let code = code_provenance();
     let configuration = json!({
-        "evaluation_engine":"paper-research-v2", "baseline_execution_family":"ict-paper-portfolio-v4",
+        "evaluation_engine":"paper-research-v3", "baseline_execution_family":"ict-paper-portfolio-v4",
         "compiled_sources_sha256":hash(&serde_json::to_vec(&code)?),
         "warmup_bars_per_segment":WARMUP,
         "split_at_first_holdout_open":split_at,
@@ -269,7 +282,7 @@ pub(super) fn report(data: &Dataset, split_at: DateTime<Utc>) -> Result<Value, B
         results.push(segment(data, split, first.len(), WARMUP, profile, "holdout")?);
     }
     Ok(json!({
-        "report_version":2,"status":"UNVALIDATED","configuration_sha256":hash(&serde_json::to_vec(&configuration)?),
+        "report_version":3,"status":"UNVALIDATED","configuration_sha256":hash(&serde_json::to_vec(&configuration)?),
         "configuration":configuration,"compiled_sources":code,"provenance":data.provenance,"manifest":data.manifest,
         "results":results,
         "limitations":[
@@ -280,6 +293,7 @@ pub(super) fn report(data: &Dataset, split_at: DateTime<Utc>) -> Result<Value, B
             "Drawdown uses candle-close equity; it is not a complete intrabar drawdown or liquidation-risk measure.",
             "Holdout is chronological, with a fresh 100-USDT account and preceding-only warmup. Development and holdout returns must not be compounded as one account.",
             "All candidate profiles are fixed before evaluation. Comparing several profiles on the same holdout does not make a chosen winner independently validated.",
+            "Dataset dates do not establish data novelty. A previously examined holdout remains reused; an earlier-period replay is a retrospective robustness check, not forward validation.",
             "Raw sweep/MSS/FVG counts are independent events, not necessarily linked setup confirmations.",
             "Fees and stop slippage are explicit scenario assumptions, not the account's verified exchange fee tier.",
             "No parameter search, strategy promotion or live deployment occurs. Positive historical PnL does not guarantee future profit."
@@ -391,6 +405,29 @@ mod tests {
         prices.push([109,110,103,109]);
         let later=segment(&fixture(&prices)?,WARMUP,prices.len(),WARMUP,PROFILES[6],"fixture")?;
         assert_eq!(later["metrics"]["open_positions_at_end"],1);
+        assert_eq!(later["metrics"]["filled_entries"],1);
+        Ok(())
+    }
+
+    #[test]
+    fn entry_v2_profiles_reach_confirmation_and_respect_the_fill_embargo() -> Result<(),BoxError> {
+        let mut prices=vec![[100,102,98,101];WARMUP];
+        let formation=setup();
+        prices.extend_from_slice(&formation[..formation.len()-1]);
+        let confirmed=segment(&fixture(&prices)?,WARMUP,prices.len(),WARMUP,PROFILES[10],"fixture")?;
+        let legacy=segment(&fixture(&prices)?,WARMUP,prices.len(),WARMUP,PROFILES[0],"fixture")?;
+        assert_eq!(confirmed["metrics"]["pending_at_end"],1);
+        assert_eq!(confirmed["metrics"]["filled_entries"],0);
+        assert_eq!(legacy["metrics"]["placed_entries"],0);
+        prices.push([110,112,103,109]);
+        let data=fixture(&prices)?;
+        let normal=segment(&data,WARMUP,prices.len(),WARMUP,PROFILES[10],"fixture")?;
+        let delayed=segment(&data,WARMUP,prices.len(),WARMUP,PROFILES[12],"fixture")?;
+        assert_eq!(normal["metrics"]["open_positions_at_end"],1);
+        assert_eq!(delayed["metrics"]["pending_at_end"],1);
+        assert_eq!(delayed["metrics"]["filled_entries"],0);
+        prices.push([109,110,103,109]);
+        let later=segment(&fixture(&prices)?,WARMUP,prices.len(),WARMUP,PROFILES[12],"fixture")?;
         assert_eq!(later["metrics"]["filled_entries"],1);
         Ok(())
     }

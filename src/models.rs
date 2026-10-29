@@ -1825,6 +1825,25 @@ pub enum FvgEntryMode {
     ConsequentEncroachment,
 }
 
+/// Evidence that made a limit-entry decision observable.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TradeIntentTrigger {
+    /// A later final candle already reached the requested FVG price.
+    #[default]
+    Retracement,
+    /// The FVG just became observable; the limit awaits a future retracement.
+    FvgConfirmation,
+}
+
+impl TradeIntentTrigger {
+    // Serde's skip_serializing_if callback requires a borrowed field.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_retracement(&self) -> bool {
+        matches!(self, Self::Retracement)
+    }
+}
+
 /// Validated construction data for a [`TradeIntent`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TradeIntentInput {
@@ -1840,11 +1859,11 @@ pub struct TradeIntentInput {
     pub liquidity_sweep: LiquiditySweep,
     /// Structure shift confirmed by the FVG's displacement candle.
     pub market_structure_shift: MarketStructureShift,
-    /// FVG into which price retraced.
+    /// FVG that determines the entry price.
     pub fair_value_gap: FairValueGap,
     /// Rule used to derive the limit-entry price from the FVG.
     pub entry_mode: FvgEntryMode,
-    /// Final candle that reached the derived entry price.
+    /// Final retracement or FVG-confirmation candle, according to constructor.
     pub trigger_candle: Candle,
     /// Time after which downstream risk code must reject the intent.
     pub expires_at: DateTime<Utc>,
@@ -1867,10 +1886,12 @@ pub struct TradeIntent {
     entry_mode: FvgEntryMode,
     trigger_candle: Candle,
     expires_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "TradeIntentTrigger::is_retracement")]
+    trigger_mode: TradeIntentTrigger,
 }
 
 impl TradeIntent {
-    /// Creates a strategy intent after validating its complete ICT evidence.
+    /// Creates a legacy intent after a later closed candle reached the FVG entry.
     ///
     /// # Errors
     ///
@@ -1878,6 +1899,26 @@ impl TradeIntent {
     /// ordering, FVG state, trigger candle, entry reach, stop anchor, or expiry
     /// are inconsistent.
     pub fn new(input: TradeIntentInput) -> Result<Self, ModelError> {
+        Self::new_with_trigger(input, TradeIntentTrigger::Retracement)
+    }
+
+    /// Creates a resting limit when the FVG's third candle closes.
+    ///
+    /// No historical touch or fill is implied. Execution must wait for a later
+    /// market observation; the current close must be on the passive limit side.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ModelError`] for inconsistent ICT evidence, a non-fresh FVG,
+    /// a different confirmation candle or boundary, or an already marketable limit.
+    pub fn new_resting(input: TradeIntentInput) -> Result<Self, ModelError> {
+        Self::new_with_trigger(input, TradeIntentTrigger::FvgConfirmation)
+    }
+
+    fn new_with_trigger(
+        input: TradeIntentInput,
+        trigger_mode: TradeIntentTrigger,
+    ) -> Result<Self, ModelError> {
         if input.id.is_nil() {
             return Err(ModelError::NilIdentifier {
                 model: "trade_intent",
@@ -1886,11 +1927,11 @@ impl TradeIntent {
 
         validate_trade_intent_series(&input)?;
         validate_trade_intent_direction(&input)?;
-        validate_trade_intent_timing(&input)?;
+        validate_trade_intent_timing(&input, trigger_mode)?;
 
         let entry_price =
             trade_intent_entry_price(input.direction, &input.fair_value_gap, input.entry_mode);
-        validate_trade_intent_trigger(&input, entry_price)?;
+        validate_trade_intent_trigger(&input, entry_price, trigger_mode)?;
 
         Ok(Self {
             id: input.id,
@@ -1903,6 +1944,7 @@ impl TradeIntent {
             entry_mode: input.entry_mode,
             trigger_candle: input.trigger_candle,
             expires_at: input.expires_at,
+            trigger_mode,
         })
     }
 
@@ -1952,6 +1994,12 @@ impl TradeIntent {
     #[must_use]
     pub const fn entry_mode(&self) -> FvgEntryMode {
         self.entry_mode
+    }
+
+    /// Returns whether this intent follows a touch or places a fresh resting limit.
+    #[must_use]
+    pub const fn trigger_mode(&self) -> TradeIntentTrigger {
+        self.trigger_mode
     }
 
     /// Derives the exact limit-entry price from the validated FVG.
@@ -2039,7 +2087,10 @@ fn validate_trade_intent_direction(input: &TradeIntentInput) -> Result<(), Model
     Ok(())
 }
 
-fn validate_trade_intent_timing(input: &TradeIntentInput) -> Result<(), ModelError> {
+fn validate_trade_intent_timing(
+    input: &TradeIntentInput,
+    trigger_mode: TradeIntentTrigger,
+) -> Result<(), ModelError> {
     if input.market_structure_shift.confirming_candle_open_time()
         != input.fair_value_gap.formed_from()[1]
     {
@@ -2062,9 +2113,17 @@ fn validate_trade_intent_timing(input: &TradeIntentInput) -> Result<(), ModelErr
     if !input.trigger_candle.is_closed() {
         return Err(ModelError::OpenTradeIntentTrigger);
     }
-    if input.trigger_candle.open_time() <= input.fair_value_gap.formed_from()[2]
-        || input.trigger_candle.close_time() < input.fair_value_gap.formed_at()
-    {
+    let valid_trigger_time = match trigger_mode {
+        TradeIntentTrigger::Retracement => {
+            input.trigger_candle.open_time() > input.fair_value_gap.formed_from()[2]
+                && input.trigger_candle.close_time() >= input.fair_value_gap.formed_at()
+        }
+        TradeIntentTrigger::FvgConfirmation => {
+            input.trigger_candle.open_time() == input.fair_value_gap.formed_from()[2]
+                && input.trigger_candle.close_time() == input.fair_value_gap.formed_at()
+        }
+    };
+    if !valid_trigger_time {
         return Err(ModelError::InvalidTradeIntentTriggerTime);
     }
     if input.expires_at <= input.trigger_candle.close_time() {
@@ -2077,11 +2136,32 @@ fn validate_trade_intent_timing(input: &TradeIntentInput) -> Result<(), ModelErr
 fn validate_trade_intent_trigger(
     input: &TradeIntentInput,
     entry_price: Decimal,
+    trigger_mode: TradeIntentTrigger,
 ) -> Result<(), ModelError> {
     let entry_reached =
         input.trigger_candle.low() <= entry_price && input.trigger_candle.high() >= entry_price;
-    if !entry_reached {
+    if trigger_mode == TradeIntentTrigger::Retracement && !entry_reached {
         return Err(ModelError::TradeIntentEntryNotReached);
+    }
+
+    if trigger_mode == TradeIntentTrigger::FvgConfirmation {
+        if !matches!(input.fair_value_gap.state(), ZoneState::Fresh) {
+            return Err(ModelError::TradeIntentRestingGapNotFresh);
+        }
+        let passive_limit = match input.direction {
+            Direction::Bullish => input.trigger_candle.close() > entry_price,
+            Direction::Bearish => input.trigger_candle.close() < entry_price,
+        };
+        if !passive_limit {
+            return Err(ModelError::TradeIntentNotResting);
+        }
+        let boundary_matches = match input.direction {
+            Direction::Bullish => input.trigger_candle.low() == input.fair_value_gap.zone().upper(),
+            Direction::Bearish => input.trigger_candle.high() == input.fair_value_gap.zone().lower(),
+        };
+        if !boundary_matches {
+            return Err(ModelError::TradeIntentConfirmationBoundaryMismatch);
+        }
     }
 
     let zone = input.fair_value_gap.zone();
@@ -2116,6 +2196,8 @@ struct TradeIntentUnchecked {
     entry_mode: FvgEntryMode,
     trigger_candle: Candle,
     expires_at: DateTime<Utc>,
+    #[serde(default)]
+    trigger_mode: TradeIntentTrigger,
 }
 
 impl<'de> Deserialize<'de> for TradeIntent {
@@ -2124,7 +2206,7 @@ impl<'de> Deserialize<'de> for TradeIntent {
         D: Deserializer<'de>,
     {
         let value = TradeIntentUnchecked::deserialize(deserializer)?;
-        Self::new(TradeIntentInput {
+        Self::new_with_trigger(TradeIntentInput {
             id: value.id,
             instrument: value.instrument,
             timeframe: value.timeframe,
@@ -2135,7 +2217,7 @@ impl<'de> Deserialize<'de> for TradeIntent {
             entry_mode: value.entry_mode,
             trigger_candle: value.trigger_candle,
             expires_at: value.expires_at,
-        })
+        }, value.trigger_mode)
         .map_err(de::Error::custom)
     }
 }
@@ -2174,7 +2256,7 @@ pub enum SignalEvent {
     MarketStructureShiftDetected(MarketStructureShift),
     /// Continuation price action confirmed a break of structure.
     BreakOfStructureDetected(BreakOfStructure),
-    /// A complete ICT setup reached its strategy-defined FVG entry.
+    /// A complete ICT setup produced its strategy-defined limit-entry decision.
     TradeIntentGenerated(Box<TradeIntent>),
 }
 
@@ -2506,9 +2588,18 @@ pub enum ModelError {
     /// A partial candle was used to trigger a trade intent.
     #[error("trade intent requires a final trigger candle")]
     OpenTradeIntentTrigger,
-    /// The trigger did not occur after the FVG became observable.
-    #[error("trade intent trigger must follow the completed FVG")]
+    /// The trigger time disagreed with the requested entry timing mode.
+    #[error("trade intent trigger time is inconsistent with its trigger mode")]
     InvalidTradeIntentTriggerTime,
+    /// A resting limit must await a future price retracement.
+    #[error("resting limit must be strictly passive relative to the confirmation close")]
+    TradeIntentNotResting,
+    /// Resting confirmation entries require a newly formed FVG.
+    #[error("resting confirmation intent requires a fresh FVG")]
+    TradeIntentRestingGapNotFresh,
+    /// The purported confirmation candle did not define the FVG boundary.
+    #[error("confirmation candle extreme must match the FVG near boundary")]
+    TradeIntentConfirmationBoundaryMismatch,
     /// Price did not reach the entry derived from the FVG.
     #[error("trade intent trigger candle did not reach the derived entry price")]
     TradeIntentEntryNotReached,
@@ -2646,6 +2737,123 @@ mod tests {
             trigger_candle,
             expires_at: at_minute(10)?,
         })
+    }
+
+    fn resting_trade_intent_input() -> Result<TradeIntentInput, Box<dyn Error>> {
+        let mut input = bullish_trade_intent_input()?;
+        input.entry_mode = FvgEntryMode::ConsequentEncroachment;
+        input.trigger_candle = Candle::new(CandleInput {
+            instrument: instrument()?,
+            timeframe: Timeframe::M1,
+            open_time: at_minute(3)?,
+            close_time: at_minute(4)?,
+            open: Decimal::from(103),
+            high: Decimal::from(104),
+            low: Decimal::from(102),
+            close: Decimal::from(103),
+            volume: Decimal::ZERO,
+            volume_unit: VolumeUnit::Contracts,
+            trade_count: None,
+            is_closed: true,
+        })?;
+        Ok(input)
+    }
+
+    #[test]
+    fn resting_intent_observes_confirmation_without_claiming_prior_touch() -> TestResult {
+        let input = resting_trade_intent_input()?;
+        assert_eq!(TradeIntent::new(input.clone()), Err(ModelError::InvalidTradeIntentTriggerTime));
+        let intent = TradeIntent::new_resting(input)?;
+        assert_eq!(intent.trigger_mode(), TradeIntentTrigger::FvgConfirmation);
+        assert_eq!(intent.entry_price(), Decimal::from(101));
+        assert!(intent.trigger_candle().low() > intent.entry_price());
+        assert_eq!(intent.triggered_at(), intent.fair_value_gap().formed_at());
+        let value = serde_json::to_value(&intent)?;
+        assert_eq!(value["trigger_mode"], json!("fvg_confirmation"));
+        assert_eq!(serde_json::from_value::<TradeIntent>(value.clone())?, intent);
+        for mode in [json!(null), json!("unknown"), json!("retracement")] {
+            let mut tampered = value.clone();
+            tampered["trigger_mode"] = mode;
+            assert!(serde_json::from_value::<TradeIntent>(tampered).is_err());
+        }
+        let mut missing_mode = value;
+        missing_mode.as_object_mut().ok_or_else(|| io::Error::other("expected object"))?.remove("trigger_mode");
+        assert!(serde_json::from_value::<TradeIntent>(missing_mode).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_intent_omits_new_mode_and_reencodes_identically() -> TestResult {
+        let intent = TradeIntent::new(bullish_trade_intent_input()?)?;
+        assert_eq!(intent.trigger_mode(), TradeIntentTrigger::Retracement);
+        let bytes = serde_json::to_vec(&intent)?;
+        let mut value = serde_json::to_value(&intent)?;
+        assert!(value.get("trigger_mode").is_none());
+        value["trigger_mode"] = json!("retracement");
+        assert_eq!(serde_json::to_vec(&serde_json::from_value::<TradeIntent>(value)?)?, bytes);
+        assert_eq!(serde_json::to_vec(&serde_json::from_slice::<TradeIntent>(&bytes)?)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn resting_intent_rejects_wrong_time_nonfresh_gap_and_inconsistent_boundary() -> TestResult {
+        for minute in [2, 4] {
+            let mut input = resting_trade_intent_input()?;
+            input.trigger_candle.open_time = at_minute(minute)?;
+            input.trigger_candle.close_time = at_minute(minute + 1)?;
+            assert_eq!(TradeIntent::new_resting(input), Err(ModelError::InvalidTradeIntentTriggerTime));
+        }
+        let mut touched = resting_trade_intent_input()?;
+        touched.fair_value_gap.mark_touched(at_minute(4)?)?;
+        assert_eq!(TradeIntent::new_resting(touched), Err(ModelError::TradeIntentRestingGapNotFresh));
+        let mut wrong_boundary = resting_trade_intent_input()?;
+        wrong_boundary.trigger_candle.low = Decimal::from(101);
+        assert_eq!(TradeIntent::new_resting(wrong_boundary), Err(ModelError::TradeIntentConfirmationBoundaryMismatch));
+        let mut expired = resting_trade_intent_input()?;
+        expired.expires_at = at_minute(4)?;
+        assert_eq!(TradeIntent::new_resting(expired), Err(ModelError::InvalidTradeIntentExpiry));
+        Ok(())
+    }
+
+    #[test]
+    fn resting_limits_require_strictly_passive_confirmation_prices_in_both_directions() -> TestResult {
+        let mut bullish = resting_trade_intent_input()?;
+        bullish.entry_mode = FvgEntryMode::NearBoundary;
+        bullish.trigger_candle.close = Decimal::from(102);
+        assert_eq!(TradeIntent::new_resting(bullish), Err(ModelError::TradeIntentNotResting));
+
+        let mut bearish = resting_trade_intent_input()?;
+        bearish.direction = Direction::Bearish;
+        bearish.liquidity_sweep = LiquiditySweep::new(LiquiditySweepInput {
+            id: Uuid::from_u128(31), instrument: instrument()?, timeframe: Timeframe::M1,
+            side: LiquiditySide::BuySide, reference_price: Decimal::from(105), sweep_price: Decimal::from(106),
+            sweep_candle_open_time: at_minute(0)?, detected_at: at_minute(1)?,
+        })?;
+        bearish.market_structure_shift = MarketStructureShift::new(MarketStructureShiftInput {
+            id: Uuid::from_u128(32), instrument: instrument()?, timeframe: Timeframe::M1,
+            direction: Direction::Bearish,
+            broken_swing: SwingPoint::new(instrument()?, Timeframe::M1, SwingKind::Low,
+                Decimal::from(101), at_minute(-1)?, at_minute(1)?, FractalModel::ThreeCandle)?,
+            break_price: Decimal::from(99), break_basis: BreakBasis::Close,
+            confirming_candle_open_time: at_minute(2)?, confirmed_at: at_minute(3)?,
+        })?;
+        bearish.fair_value_gap = FairValueGap::new(FairValueGapInput {
+            id: Uuid::from_u128(33), instrument: instrument()?, timeframe: Timeframe::M1,
+            direction: Direction::Bearish, zone: PriceZone::new(Decimal::from(100), Decimal::from(102))?,
+            formed_from: [at_minute(1)?, at_minute(2)?, at_minute(3)?], formed_at: at_minute(4)?,
+        })?;
+        bearish.trigger_candle = Candle::new(CandleInput {
+            instrument: instrument()?, timeframe: Timeframe::M1,
+            open_time: at_minute(3)?, close_time: at_minute(4)?,
+            open: Decimal::from(99), high: Decimal::from(100), low: Decimal::from(98), close: Decimal::from(99),
+            volume: Decimal::ZERO, volume_unit: VolumeUnit::Contracts, trade_count: None, is_closed: true,
+        })?;
+        let intent = TradeIntent::new_resting(bearish.clone())?;
+        assert!(intent.trigger_candle().high() < intent.entry_price());
+        bearish.entry_mode = FvgEntryMode::NearBoundary;
+        bearish.trigger_candle.close = Decimal::from(100);
+        assert_eq!(TradeIntent::new_resting(bearish), Err(ModelError::TradeIntentNotResting));
+        Ok(())
     }
 
     #[test]

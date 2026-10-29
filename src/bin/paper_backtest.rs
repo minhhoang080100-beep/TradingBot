@@ -27,7 +27,9 @@ Fixed comparisons: Always / Killzones, each at 6/2 and stressed 10/5 bps
 fees/stop slippage, plus a research-only nearest-viable-target hypothesis
 under Always at both costs. Four extra Always profiles test a fixed one-bar
 entry embargo for both target policies and cost assumptions. This is a timing
-sensitivity test, not a real latency model. Risk and leverage are not tuned.
+sensitivity test, not a real latency model. Eight entry-v2 profiles additionally
+place a resting CE limit at FVG confirmation, retaining confirmed setup context;
+both target policies, costs and fill timings are compared. Risk is not tuned.
 Reports include source/config hashes, costs, drawdown, unclosed exposure,
 trade events, and explicit limitations. Output must not already exist.
 Results are UNVALIDATED: OHLC simulation excludes funding and liquidation.

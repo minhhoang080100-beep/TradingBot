@@ -6,13 +6,14 @@
 //!
 //! With closed candles as its only market input, retracement detection is
 //! necessarily post-close. A production low-latency deployment should feed an
-//! intrabar price trigger into this layer or place a resting limit as soon as
-//! the FVG is armed; a post-close intent does not prove the quoted price is
-//! still executable.
+//! intrabar price trigger into this layer. The explicit research-only resting
+//! policy instead places its limit when the FVG is confirmed; neither policy
+//! treats the decision candle as an execution fill.
 
 use std::{collections::HashMap, num::NonZeroU16, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -27,6 +28,7 @@ use crate::{
 };
 
 const STRATEGY_ALGORITHM_VERSION: &str = "ict-strategy-v1";
+const RESTING_STRATEGY_ALGORITHM_VERSION: &str = "ict-strategy-resting-v2";
 const CANCELLATION_RETRY_INTERVAL: ChronoDuration = ChronoDuration::seconds(5);
 const INTENT_NAMESPACE: Uuid = Uuid::from_bytes([
     0x26, 0x81, 0x42, 0x0f, 0x2c, 0x8b, 0x4e, 0x75, 0xa9, 0x50, 0x2b, 0x51, 0xd4, 0x81, 0x91, 0x03,
@@ -70,12 +72,35 @@ pub enum StrategyStage {
 /// How the New York/London session classification affects entries.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum KillzonePolicy {
-    /// Setup formation is unrestricted, but a touched entry outside a killzone
-    /// is considered missed and the setup is discarded.
+    /// Setup formation is unrestricted, but the entry decision must occur in
+    /// a killzone. Legacy decisions use the retracement close; resting-limit
+    /// decisions use the FVG confirmation close. Otherwise discard the setup.
     #[default]
     EntryOnly,
     /// Killzones have no effect on setup formation or entry.
     Disabled,
+}
+
+/// Explicit entry-timing experiment; existing deployments retain the legacy default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyEntryPolicy {
+    /// Wait for a closed retracement candle before generating an entry intent.
+    #[default]
+    LegacyRetracement,
+    /// Research candidate: retain confirmed MSS context and place a fresh FVG limit.
+    RestingOnConfirmation,
+}
+
+impl StrategyEntryPolicy {
+    /// Stable profile identifier used by research output and configuration.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyRetracement => "legacy_retracement",
+            Self::RestingOnConfirmation => "resting_on_confirmation",
+        }
+    }
 }
 
 /// Immutable strategy settings.
@@ -84,10 +109,11 @@ pub struct StrategyConfig {
     entry_mode: FvgEntryMode,
     time_to_live_bars: NonZeroU16,
     killzone_policy: KillzonePolicy,
+    entry_policy: StrategyEntryPolicy,
 }
 
 impl StrategyConfig {
-    /// Creates a strategy configuration.
+    /// Creates a strategy configuration with the legacy retracement policy.
     #[must_use]
     pub const fn new(
         entry_mode: FvgEntryMode,
@@ -98,6 +124,7 @@ impl StrategyConfig {
             entry_mode,
             time_to_live_bars,
             killzone_policy,
+            entry_policy: StrategyEntryPolicy::LegacyRetracement,
         }
     }
 
@@ -118,6 +145,19 @@ impl StrategyConfig {
     pub const fn killzone_policy(&self) -> KillzonePolicy {
         self.killzone_policy
     }
+
+    /// Selects an explicit entry-timing policy without changing other settings.
+    #[must_use]
+    pub const fn with_entry_policy(mut self, policy: StrategyEntryPolicy) -> Self {
+        self.entry_policy = policy;
+        self
+    }
+
+    /// Configured entry-timing policy.
+    #[must_use]
+    pub const fn entry_policy(&self) -> StrategyEntryPolicy {
+        self.entry_policy
+    }
 }
 
 impl Default for StrategyConfig {
@@ -126,6 +166,7 @@ impl Default for StrategyConfig {
             entry_mode: FvgEntryMode::ConsequentEncroachment,
             time_to_live_bars: NonZeroU16::new(12).unwrap_or(NonZeroU16::MIN),
             killzone_policy: KillzonePolicy::EntryOnly,
+            entry_policy: StrategyEntryPolicy::LegacyRetracement,
         }
     }
 }
@@ -192,6 +233,10 @@ pub enum SetupDiscardReason {
     FarBoundaryViolated,
     /// Entry was first reached outside every enabled killzone.
     EntryTouchedOutsideKillzone,
+    /// A fresh resting-limit confirmation occurred outside the entry window.
+    ConfirmationOutsideKillzone,
+    /// Price crossed the original sweep extreme before resting-limit placement.
+    SweepExtremeViolated,
     /// The ICT engine reset this series after a candle gap.
     SeriesReset,
     /// The entry FVG reached a terminal invalidated state.
@@ -238,7 +283,7 @@ pub enum DataDegradationReason {
 /// Observable outputs from the strategy state machine.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StrategyAction {
-    /// A complete, validated setup reached its configured FVG entry.
+    /// A complete, validated setup produced its configured limit-entry decision.
     TradeIntentGenerated(Box<TradeIntent>),
     /// Execution should cancel an unfilled entry intent.
     CancelPendingIntent {
@@ -723,20 +768,34 @@ impl StrategyEngine {
             actions.push(action);
         }
 
+        if self.config.entry_policy == StrategyEntryPolicy::RestingOnConfirmation {
+            invalidate_broken_sweep(&mut state, &key, candle, &mut actions);
+        }
+
         accept_sweep(
             &mut state,
             normalized.sweep.clone(),
             &key,
             candle.close_time(),
             &mut actions,
+            self.config.entry_policy,
         );
-        if let Err(error) = self.evaluate_armed_setup(&mut state, &key, candle, batch, &mut actions)
-        {
-            self.series.insert(key, state);
-            return Err(error);
+        if self.config.entry_policy == StrategyEntryPolicy::LegacyRetracement {
+            if let Err(error) = self.evaluate_armed_setup(&mut state, &key, candle, batch, &mut actions)
+            {
+                self.series.insert(key, state);
+                return Err(error);
+            }
         }
         progress_impulse(&mut state, &key, candle, batch, &normalized, &mut actions);
         qualify_mss(&mut state, candle, batch, normalized.mss);
+        if self.config.entry_policy == StrategyEntryPolicy::RestingOnConfirmation {
+            if let Err(error) = self.evaluate_armed_setup(&mut state, &key, candle, batch, &mut actions)
+            {
+                self.series.insert(key, state);
+                return Err(error);
+            }
+        }
 
         self.series.insert(key, state);
         Ok(actions)
@@ -756,7 +815,9 @@ impl StrategyEngine {
             return Ok(());
         };
 
-        if candle.open_time() <= armed.fvg.formed_from()[2] {
+        if self.config.entry_policy == StrategyEntryPolicy::LegacyRetracement
+            && candle.open_time() <= armed.fvg.formed_from()[2]
+        {
             state.phase = SeriesPhase::Armed(armed);
             return Ok(());
         }
@@ -770,7 +831,9 @@ impl StrategyEngine {
             return Ok(());
         }
 
-        if !entry_reached(&armed, candle, self.config.entry_mode) {
+        if self.config.entry_policy == StrategyEntryPolicy::LegacyRetracement
+            && !entry_reached(&armed, candle, self.config.entry_mode)
+        {
             state.phase = SeriesPhase::Armed(armed);
             return Ok(());
         }
@@ -779,7 +842,10 @@ impl StrategyEngine {
             actions.push(StrategyAction::SetupDiscarded {
                 key: key.clone(),
                 at: candle.close_time(),
-                reason: SetupDiscardReason::EntryTouchedOutsideKillzone,
+                reason: match self.config.entry_policy {
+                    StrategyEntryPolicy::LegacyRetracement => SetupDiscardReason::EntryTouchedOutsideKillzone,
+                    StrategyEntryPolicy::RestingOnConfirmation => SetupDiscardReason::ConfirmationOutsideKillzone,
+                },
             });
             return Ok(());
         }
@@ -791,8 +857,8 @@ impl StrategyEngine {
                 return Err(error);
             }
         };
-        let intent_result = TradeIntent::new(TradeIntentInput {
-            id: trade_intent_id(&armed, candle, self.config.entry_mode, expires_at),
+        let input = TradeIntentInput {
+            id: trade_intent_id(&armed, candle, self.config.entry_mode, expires_at, self.config.entry_policy),
             instrument: candle.instrument().clone(),
             timeframe: candle.timeframe(),
             direction: armed.direction,
@@ -802,7 +868,11 @@ impl StrategyEngine {
             entry_mode: self.config.entry_mode,
             trigger_candle: candle.clone(),
             expires_at,
-        });
+        };
+        let intent_result = match self.config.entry_policy {
+            StrategyEntryPolicy::LegacyRetracement => TradeIntent::new(input),
+            StrategyEntryPolicy::RestingOnConfirmation => TradeIntent::new_resting(input),
+        };
         let intent = match intent_result {
             Ok(intent) => intent,
             Err(error) => {
@@ -1409,6 +1479,7 @@ fn accept_sweep(
     key: &CandleKey,
     at: DateTime<Utc>,
     actions: &mut Vec<StrategyAction>,
+    entry_policy: StrategyEntryPolicy,
 ) {
     let Some(sweep) = sweep else {
         return;
@@ -1417,6 +1488,11 @@ fn accept_sweep(
         state.phase,
         SeriesPhase::IntentPending(_) | SeriesPhase::CancelRequested(_) | SeriesPhase::Position(_)
     ) {
+        return;
+    }
+    if entry_policy == StrategyEntryPolicy::RestingOnConfirmation
+        && matches!(state.phase, SeriesPhase::Impulse(_) | SeriesPhase::Armed(_))
+    {
         return;
     }
     if matches!(
@@ -1431,6 +1507,28 @@ fn accept_sweep(
         direction,
         age_bars: 0,
     });
+}
+
+fn invalidate_broken_sweep(
+    state: &mut SeriesState,
+    key: &CandleKey,
+    candle: &Candle,
+    actions: &mut Vec<StrategyAction>,
+) {
+    let context = match &state.phase {
+        SeriesPhase::Swept(swept) => Some((&swept.sweep, swept.direction)),
+        SeriesPhase::Impulse(impulse) => Some((&impulse.sweep, impulse.direction)),
+        SeriesPhase::Armed(armed) => Some((&armed.sweep, armed.direction)),
+        _ => None,
+    };
+    let broken = context.is_some_and(|(sweep, direction)| match direction {
+        Direction::Bullish => candle.low() < sweep.sweep_price(),
+        Direction::Bearish => candle.high() > sweep.sweep_price(),
+    });
+    if broken {
+        state.phase = SeriesPhase::Idle;
+        actions.push(discarded(key, candle.close_time(), SetupDiscardReason::SweepExtremeViolated));
+    }
 }
 
 fn qualify_mss(
@@ -1515,9 +1613,14 @@ fn trade_intent_id(
     candle: &Candle,
     mode: FvgEntryMode,
     expires_at: DateTime<Utc>,
+    entry_policy: StrategyEntryPolicy,
 ) -> Uuid {
+    let algorithm_version = match entry_policy {
+        StrategyEntryPolicy::LegacyRetracement => STRATEGY_ALGORITHM_VERSION,
+        StrategyEntryPolicy::RestingOnConfirmation => RESTING_STRATEGY_ALGORITHM_VERSION,
+    };
     let name = format!(
-        "{STRATEGY_ALGORITHM_VERSION}|{:?}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}",
+        "{algorithm_version}|{:?}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}",
         candle.instrument().exchange,
         candle.instrument().market,
         candle.instrument().venue_symbol,
@@ -1770,6 +1873,187 @@ mod tests {
             }),
             ..SeriesState::default()
         }
+    }
+
+    fn confirmation_batch() -> Result<(Candle, IctDetectionBatch), Box<dyn Error>> {
+        let mut detector = IctEngine::new(IctEngineConfig::default());
+        for minute in -18..2 {
+            detector.process_candle(&candle(minute, 90, 100, 95)?)?;
+        }
+        let displacement = Candle::new(CandleInput {
+            instrument: instrument()?, timeframe: Timeframe::M1,
+            open_time: at_minute(2)?, close_time: at_minute(3)?,
+            open: Decimal::from(95), high: Decimal::from(112), low: Decimal::from(94), close: Decimal::from(111),
+            volume: Decimal::ONE, volume_unit: VolumeUnit::Contracts, trade_count: Some(1), is_closed: true,
+        })?;
+        assert_eq!(detector.process_candle(&displacement)?.displacement(), Some(Direction::Bullish));
+        let confirmation = candle(3, 110, 115, 112)?;
+        let batch = detector.process_candle(&confirmation)?;
+        Ok((confirmation, batch))
+    }
+
+    fn state_with_impulse() -> Result<SeriesState, Box<dyn Error>> {
+        let armed = fixture_armed(fixture_fvg()?)?;
+        Ok(SeriesState {
+            phase: SeriesPhase::Impulse(PendingImpulse {
+                sweep: armed.sweep, mss: armed.mss, direction: armed.direction, age_bars: 1,
+            }),
+            ..SeriesState::default()
+        })
+    }
+
+    #[test]
+    fn resting_policy_emits_on_confirmation_while_legacy_waits_for_retracement() -> TestResult {
+        let key = key_for(instrument()?);
+        let (confirmation, batch) = confirmation_batch()?;
+        let state = state_with_impulse()?;
+        let config = strategy_config(FvgEntryMode::ConsequentEncroachment, 12);
+        assert_eq!(config.entry_policy(), StrategyEntryPolicy::LegacyRetracement);
+        assert_eq!(StrategyConfig::default().entry_policy(), StrategyEntryPolicy::LegacyRetracement);
+        let mut legacy = StrategyEngine::new(config);
+        legacy.series.insert(key.clone(), state.clone());
+        let legacy_actions = legacy.process_analyzed_candle(&confirmation, &batch)?;
+        assert!(!legacy_actions.iter().any(|a| matches!(a, StrategyAction::TradeIntentGenerated(_))));
+        assert_eq!(legacy.stage(&key), StrategyStage::WaitingForRetracement);
+
+        let mut candidate = StrategyEngine::new(config.with_entry_policy(StrategyEntryPolicy::RestingOnConfirmation));
+        candidate.series.insert(key.clone(), state);
+        let actions = candidate.process_analyzed_candle(&confirmation, &batch)?;
+        assert_eq!(actions.iter().filter(|a| matches!(a, StrategyAction::TradeIntentGenerated(_))).count(), 1);
+        let intent = candidate.pending_intent(&key).ok_or_else(|| io::Error::other("missing resting intent"))?.clone();
+        assert_eq!(intent.trigger_mode(), crate::models::TradeIntentTrigger::FvgConfirmation);
+        assert_eq!(intent.entry_price(), Decimal::from(105));
+        assert!(intent.trigger_candle().low() > intent.entry_price());
+        assert_eq!(intent.triggered_at(), at_minute(4)?);
+        assert_eq!(intent.expires_at(), at_minute(16)?);
+        assert_eq!(candidate.stage(&key), StrategyStage::EntryPending);
+        assert_eq!(candidate.state(&key), StrategyState::WaitingForRetracement);
+        // A shallow subsequent candle neither creates a second order nor infers a fill.
+        let missed = candle(4, 106, 116, 112)?;
+        candidate.process_analyzed_candle(&missed, &empty_batch(&missed)?)?;
+        assert_eq!(candidate.pending_intent(&key).map(TradeIntent::id), Some(intent.id()));
+        assert_eq!(candidate.stage(&key), StrategyStage::EntryPending);
+        Ok(())
+    }
+
+    #[test]
+    fn resting_policy_retains_confirmed_context_without_resetting_age_on_new_sweeps() -> TestResult {
+        let key = key_for(instrument()?);
+        let mut state = state_with_impulse()?;
+        let original = match &state.phase {
+            SeriesPhase::Impulse(impulse) => impulse.sweep.id(),
+            _ => return Err(io::Error::other("expected impulse").into()),
+        };
+        let mut actions = Vec::new();
+        accept_sweep(&mut state, Some(fixture_sweep()?), &key, at_minute(4)?, &mut actions, StrategyEntryPolicy::RestingOnConfirmation);
+        assert!(actions.is_empty());
+        assert!(matches!(&state.phase, SeriesPhase::Impulse(impulse) if impulse.sweep.id() == original && impulse.age_bars == 1));
+        accept_sweep(&mut state, Some(fixture_sweep()?), &key, at_minute(4)?, &mut actions, StrategyEntryPolicy::LegacyRetracement);
+        assert!(matches!(state.phase, SeriesPhase::Swept(_)));
+        assert!(matches!(actions.as_slice(), [StrategyAction::SetupDiscarded { reason: SetupDiscardReason::SupersededByNewSweep, .. }]));
+        Ok(())
+    }
+
+    #[test]
+    fn retained_impulse_is_discarded_if_original_sweep_extreme_breaks() -> TestResult {
+        let mut engine = StrategyEngine::new(strategy_config(FvgEntryMode::ConsequentEncroachment, 12)
+            .with_entry_policy(StrategyEntryPolicy::RestingOnConfirmation));
+        let key = key_for(instrument()?);
+        engine.series.insert(key.clone(), state_with_impulse()?);
+        let broken = candle(3, 89, 115, 112)?;
+        let actions = engine.process_analyzed_candle(&broken, &empty_batch(&broken)?)?;
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::SetupDiscarded { reason: SetupDiscardReason::SweepExtremeViolated, .. })));
+        assert_eq!(engine.stage(&key), StrategyStage::WaitingForSweep);
+        Ok(())
+    }
+
+    #[test]
+    fn swept_context_cannot_qualify_after_its_extreme_breaks_in_either_direction() -> TestResult {
+        let key = key_for(instrument()?);
+        let bearish_sweep = LiquiditySweep::new(crate::models::LiquiditySweepInput {
+            id: Uuid::new_v4(), instrument: instrument()?, timeframe: Timeframe::M1,
+            side: LiquiditySide::BuySide, reference_price: Decimal::from(125), sweep_price: Decimal::from(130),
+            sweep_candle_open_time: at_minute(1)?, detected_at: at_minute(2)?,
+        })?;
+        for (sweep, direction, breached) in [
+            (fixture_sweep()?, Direction::Bullish, candle(2, 89, 115, 112)?),
+            (bearish_sweep, Direction::Bearish, candle(2, 105, 131, 106)?),
+        ] {
+            let mut state = SeriesState {
+                phase: SeriesPhase::Swept(PendingSweep { sweep, direction, age_bars: 0 }),
+                ..SeriesState::default()
+            };
+            let mut actions = Vec::new();
+            invalidate_broken_sweep(&mut state, &key, &breached, &mut actions);
+            assert!(matches!(state.phase, SeriesPhase::Idle));
+            assert!(matches!(actions.as_slice(), [StrategyAction::SetupDiscarded { reason: SetupDiscardReason::SweepExtremeViolated, .. }]));
+            // A newly observed sweep may establish a new context after invalidation.
+            let replacement = fixture_sweep()?;
+            let replacement_id = replacement.id();
+            accept_sweep(&mut state, Some(replacement), &key, breached.close_time(), &mut actions, StrategyEntryPolicy::RestingOnConfirmation);
+            assert!(matches!(&state.phase, SeriesPhase::Swept(swept) if swept.sweep.id() == replacement_id));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resting_confirmation_respects_killzones_and_pending_cancellation() -> TestResult {
+        let key = key_for(instrument()?);
+        let (confirmation, batch) = confirmation_batch()?;
+        assert!(batch.killzone().is_none());
+        let mut filtered = StrategyEngine::new(StrategyConfig::default().with_entry_policy(StrategyEntryPolicy::RestingOnConfirmation));
+        filtered.series.insert(key.clone(), state_with_impulse()?);
+        let actions = filtered.process_analyzed_candle(&confirmation, &batch)?;
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::SetupDiscarded { reason: SetupDiscardReason::ConfirmationOutsideKillzone, .. })));
+        assert!(filtered.pending_intent(&key).is_none());
+
+        let mut candidate = StrategyEngine::new(strategy_config(FvgEntryMode::ConsequentEncroachment, 12)
+            .with_entry_policy(StrategyEntryPolicy::RestingOnConfirmation));
+        candidate.series.insert(key.clone(), state_with_impulse()?);
+        candidate.process_analyzed_candle(&confirmation, &batch)?;
+        let violation = candle(4, 99, 113, 99)?;
+        let actions = candidate.process_analyzed_candle(&violation, &empty_batch(&violation)?)?;
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::CancelPendingIntent { reason: CancellationReason::FairValueGapInvalidated, .. })));
+        assert_eq!(candidate.stage(&key), StrategyStage::CancellationPending);
+        Ok(())
+    }
+
+    #[test]
+    fn resting_pending_order_keeps_twelve_bar_expiry() -> TestResult {
+        let key = key_for(instrument()?);
+        let (confirmation, batch) = confirmation_batch()?;
+        let mut candidate = StrategyEngine::new(strategy_config(FvgEntryMode::ConsequentEncroachment, 12)
+            .with_entry_policy(StrategyEntryPolicy::RestingOnConfirmation));
+        candidate.series.insert(key.clone(), state_with_impulse()?);
+        candidate.process_analyzed_candle(&confirmation, &batch)?;
+        for minute in 4..15 {
+            let missed = candle(minute, 111, 116, 112)?;
+            candidate.process_analyzed_candle(&missed, &empty_batch(&missed)?)?;
+            assert_eq!(candidate.stage(&key), StrategyStage::EntryPending);
+        }
+        let expired = candle(15, 111, 116, 112)?;
+        let actions = candidate.process_analyzed_candle(&expired, &empty_batch(&expired)?)?;
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::CancelPendingIntent { reason: CancellationReason::TimeToLiveExpired, .. })));
+        assert_eq!(candidate.stage(&key), StrategyStage::CancellationPending);
+        Ok(())
+    }
+
+    #[test]
+    fn resting_policy_has_distinct_repeatable_ids_and_preserves_legacy_id_bytes() -> TestResult {
+        let armed = fixture_armed(fixture_fvg()?)?;
+        let trigger = candle(4, 105, 120, 111)?;
+        let expires = at_minute(17)?;
+        let mode = FvgEntryMode::ConsequentEncroachment;
+        let legacy_name = format!("ict-strategy-v1|{:?}|{:?}|{}|{}|{}|{}|{}|{:?}|{}|{}",
+            trigger.instrument().exchange, trigger.instrument().market, trigger.instrument().venue_symbol,
+            trigger.timeframe(), armed.sweep.id(), armed.mss.id(), armed.fvg.id(), mode,
+            trigger.open_time().timestamp_millis(), expires.timestamp_millis());
+        let legacy = trade_intent_id(&armed, &trigger, mode, expires, StrategyEntryPolicy::LegacyRetracement);
+        assert_eq!(legacy, Uuid::new_v5(&INTENT_NAMESPACE, legacy_name.as_bytes()));
+        let candidate = trade_intent_id(&armed, &trigger, mode, expires, StrategyEntryPolicy::RestingOnConfirmation);
+        assert_ne!(candidate, legacy);
+        assert_eq!(candidate, trade_intent_id(&armed, &trigger, mode, expires, StrategyEntryPolicy::RestingOnConfirmation));
+        Ok(())
     }
 
     #[test]

@@ -15,7 +15,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::models::{Direction, InstrumentId, LiquiditySide, MarketKind, TradeIntent};
+use crate::models::{
+    Direction, InstrumentId, LiquiditySide, MarketKind, TradeIntent, TradeIntentTrigger,
+};
 
 mod checkpoint;
 pub use checkpoint::{RiskCheckpoint, RiskPlanCheckpoint};
@@ -2022,7 +2024,16 @@ fn request_fingerprint(
         maximum,
         spec.quote_value_per_price_unit.normalize(),
     );
-    let fingerprint = format!("{intent_key}|{target_key}|{spec_key}");
+    let mut fingerprint = format!("{intent_key}|{target_key}|{spec_key}");
+    // Historical retracement approvals must retain their exact hash bytes for
+    // journal/checkpoint replay. Bind the new causal decision policy explicitly
+    // instead of relying on timestamps or a strategy-generated intent ID alone.
+    match intent.trigger_mode() {
+        TradeIntentTrigger::Retracement => {}
+        TradeIntentTrigger::FvgConfirmation => {
+            fingerprint.push_str("|trigger=fvg_confirmation-v1");
+        }
+    }
     Uuid::new_v5(&APPROVAL_NAMESPACE, fingerprint.as_bytes())
 }
 
@@ -2172,6 +2183,100 @@ mod tests {
 
     fn bullish_intent() -> Result<TradeIntent, Box<dyn Error>> {
         bullish_intent_with_id(Uuid::from_u128(13))
+    }
+
+    fn bullish_resting_intent() -> Result<TradeIntent, Box<dyn Error>> {
+        let legacy = bullish_intent()?;
+        let trigger = Candle::new(CandleInput {
+            instrument: legacy.instrument().clone(),
+            timeframe: Timeframe::M1,
+            open_time: at_minute(3)?,
+            close_time: at_minute(4)?,
+            open: Decimal::new(103, 0),
+            high: Decimal::new(104, 0),
+            low: Decimal::new(102, 0),
+            close: Decimal::new(103, 0),
+            volume: Decimal::ONE,
+            volume_unit: VolumeUnit::Contracts,
+            trade_count: Some(1),
+            is_closed: true,
+        })?;
+        Ok(TradeIntent::new_resting(TradeIntentInput {
+            id: legacy.id(),
+            instrument: legacy.instrument().clone(),
+            timeframe: legacy.timeframe(),
+            direction: legacy.direction(),
+            liquidity_sweep: legacy.liquidity_sweep().clone(),
+            market_structure_shift: legacy.market_structure_shift().clone(),
+            fair_value_gap: legacy.fair_value_gap().clone(),
+            entry_mode: FvgEntryMode::ConsequentEncroachment,
+            trigger_candle: trigger,
+            expires_at: legacy.expires_at(),
+        })?)
+    }
+
+    #[test]
+    fn request_fingerprint_preserves_legacy_and_binds_resting_policy() -> TestResult {
+        let target = target(Decimal::new(112, 0))?;
+        let spec = risk_spec()?;
+        // Fixed values protect historical approvals and the explicitly versioned
+        // confirmation policy independently of the checkpoint round-trip below.
+        assert_eq!(
+            request_fingerprint(&bullish_intent()?, &target, &spec),
+            Uuid::parse_str("23f2a53e-a0fc-5b0b-bbff-99e6c343e75f")?
+        );
+        assert_eq!(
+            request_fingerprint(&bullish_resting_intent()?, &target, &spec),
+            Uuid::parse_str("1650fd84-f862-5387-8aa3-c5943b1eb651")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resting_approval_roundtrips_and_rejects_conflicting_replay() -> TestResult {
+        let intent = bullish_resting_intent()?;
+        assert!(intent.trigger_candle().low() > intent.entry_price());
+        let encoded = serde_json::to_vec(&intent)?;
+        let restored_intent: TradeIntent = serde_json::from_slice(&encoded)?;
+        assert_eq!(restored_intent, intent);
+        assert_eq!(restored_intent.trigger_mode(), TradeIntentTrigger::FvgConfirmation);
+
+        let mut manager = RiskManager::new(RiskConfig::default());
+        manager.register_instrument_spec(risk_spec()?)?;
+        manager.start_trading_day(
+            Decimal::new(10_000, 0), Decimal::new(10_000, 0), before_minute(4)?, false,
+        )?;
+        let target = target(Decimal::new(112, 0))?;
+        let plan = approved_plan(manager.assess_trade(&restored_intent, &target, at_minute(4)?)?)?;
+        assert_eq!(plan.entry_price(), Decimal::new(101, 0));
+        assert_eq!(plan.approved_at(), intent.triggered_at());
+        assert!(plan.stop_loss_price() < intent.stop_anchor_price());
+        let checkpoint = manager.checkpoint();
+        let mut restored = RiskManager::restore(serde_json::from_slice(
+            &serde_json::to_vec(&checkpoint)?,
+        )?)?;
+        assert_eq!(restored.checkpoint(), checkpoint);
+        assert_eq!(restored.active_reserved_risk()?, plan.planned_loss());
+        assert_eq!(
+            restored.assess_trade(&restored_intent, &target, at_minute(4)?)?,
+            TradeAssessment::Replay { approval_id: plan.approval_id(), intent_id: intent.id() }
+        );
+        let changed_target = LiquidityTarget::new(
+            target.id(), target.instrument().clone(), target.side(),
+            Decimal::new(113, 0), target.observed_at(),
+        )?;
+        assert_eq!(
+            restored.assess_trade(&restored_intent, &changed_target, at_minute(4)?),
+            Err(RiskError::ConflictingIntentReplay)
+        );
+        // Reusing the same ID for the later retracement decision cannot borrow
+        // the earlier approval, even with identical sweep/MSS/FVG identities.
+        restored.update_equity(Decimal::new(10_000, 0), before_minute(5)?)?;
+        assert_eq!(
+            restored.assess_trade(&bullish_intent()?, &target, at_minute(5)?),
+            Err(RiskError::ConflictingIntentReplay)
+        );
+        Ok(())
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::{
     models::{Candle, Direction, Exchange, LiquiditySide, MarketKind, SignalEvent, SwingKind, SwingPoint,
         Timeframe, TradeIntent, VolumeUnit},
     risk::{LiquidityTarget, ReservationEvent, RiskConfig, RiskError, RiskManager, TradeAssessment},
-    strategy::{KillzonePolicy, SetupDiscardReason, StrategyAction, StrategyCommand, StrategyConfig, StrategyEngine, StrategyStage},
+    strategy::{KillzonePolicy, SetupDiscardReason, StrategyAction, StrategyCommand, StrategyConfig, StrategyEngine, StrategyEntryPolicy, StrategyStage},
 };
 
 use super::{
@@ -81,12 +81,12 @@ impl PaperEntryWindow {
         match self { Self::Killzones => KillzoneFilter::default().allows(at), Self::Always => true }
     }
 
-    fn strategy_config(self) -> StrategyConfig {
+    fn strategy_config(self, entry_policy: StrategyEntryPolicy) -> StrategyConfig {
         let defaults = StrategyConfig::default();
         StrategyConfig::new(defaults.entry_mode(), defaults.time_to_live_bars(), match self {
             Self::Killzones => KillzonePolicy::EntryOnly,
             Self::Always => KillzonePolicy::Disabled,
-        })
+        }).with_entry_policy(entry_policy)
     }
 }
 
@@ -469,12 +469,13 @@ struct SymbolState {
 }
 
 impl SymbolState {
-    fn new(instrument: PaperInstrument, timeframe: Timeframe, entry_window: PaperEntryWindow) -> Self {
+    fn new(instrument: PaperInstrument, timeframe: Timeframe, entry_window: PaperEntryWindow,
+        entry_policy: StrategyEntryPolicy) -> Self {
         let config = IctEngineConfig::default();
         let liquidity_capacity = config.limits().swing_capacity().get();
         Self { key: CandleKey { instrument: instrument.spec.instrument().clone(), timeframe },
             instrument, ict: IctEngine::new(config),
-            discovery: StrategyEngine::new(entry_window.strategy_config()),
+            discovery: StrategyEngine::new(entry_window.strategy_config(entry_policy)),
             liquidity: VecDeque::new(), liquidity_capacity,
             last_analyzed_close: None, last_discard: None, live: LiveSetupCounters::default() }
     }
@@ -566,6 +567,7 @@ pub struct MultiPortfolio {
     timeframe: Timeframe,
     entry_window: PaperEntryWindow,
     target_policy: PaperTargetPolicy,
+    entry_policy: StrategyEntryPolicy,
     risk: RiskManager,
     book: PaperBook,
     history: BTreeMap<DateTime<Utc>, Vec<Candle>>,
@@ -624,6 +626,22 @@ impl MultiPortfolio {
         timeframe: Timeframe, entry_window: PaperEntryWindow, target_policy: PaperTargetPolicy,
         fill_timing: PaperFillTiming,
     ) -> Result<Self, MultiPortfolioError> {
+        Self::new_for_research_with_entry_policy(instruments, config, timeframe, entry_window,
+            target_policy, fill_timing, StrategyEntryPolicy::LegacyRetracement)
+    }
+
+    /// Creates a research portfolio with an explicit entry-state-machine policy.
+    ///
+    /// Resting-on-confirmation may create a pending order before any retracement.
+    /// The book still owns all fills, cash, margin and risk limits. This policy is
+    /// not selectable in V1-V4 journals or the existing live CLI.
+    ///
+    /// # Errors
+    /// Rejects unsupported/duplicate instruments, non-M1 input and bad metadata.
+    pub fn new_for_research_with_entry_policy(instruments: Vec<PaperInstrument>, config: PaperConfig,
+        timeframe: Timeframe, entry_window: PaperEntryWindow, target_policy: PaperTargetPolicy,
+        fill_timing: PaperFillTiming, entry_policy: StrategyEntryPolicy,
+    ) -> Result<Self, MultiPortfolioError> {
         if instruments.is_empty() || instruments.len() > 2 || timeframe != Timeframe::M1 {
             return Err(PortfolioError::Configuration("expected one or two M1 instruments").into());
         }
@@ -646,12 +664,12 @@ impl MultiPortfolio {
             }
             let symbol = identity.venue_symbol.as_str().to_owned();
             risk.register_instrument_spec(instrument.spec.clone())?;
-            if symbols.insert(symbol, SymbolState::new(instrument, timeframe, entry_window)).is_some() {
+            if symbols.insert(symbol, SymbolState::new(instrument, timeframe, entry_window, entry_policy)).is_some() {
                 return Err(PortfolioError::Configuration("duplicate instrument").into());
             }
         }
         Ok(Self { symbols, owners: BTreeMap::new(), consumed_mss: BTreeSet::new(),
-            consumed_fvg: BTreeSet::new(), timeframe, entry_window, target_policy, risk, book: PaperBook::new_for_research(config, fill_timing)?,
+            consumed_fvg: BTreeSet::new(), timeframe, entry_window, target_policy, entry_policy, risk, book: PaperBook::new_for_research(config, fill_timing)?,
             history: BTreeMap::new(), phase: Phase::WarmingUp, insolvent: false })
     }
 
@@ -666,6 +684,10 @@ impl MultiPortfolio {
     /// Reports the fixed research timing; ordinary live/replay sessions are immediate.
     #[must_use]
     pub const fn fill_timing(&self) -> PaperFillTiming { self.book.fill_timing() }
+
+    /// Entry algorithm inherited by discovery and every transferred owner.
+    #[must_use]
+    pub const fn entry_policy(&self) -> StrategyEntryPolicy { self.entry_policy }
 
     /// Initializes symbol contexts without creating historical orders or fills.
     ///
@@ -892,7 +914,7 @@ impl MultiPortfolio {
                     analysis.intents += 1;
                     // Move the actual pending strategy; never fake a fill/exit
                     // merely to let the symbol search for its next setup.
-                    let strategy_config = self.entry_window.strategy_config();
+                    let strategy_config = self.entry_window.strategy_config(self.entry_policy);
                     let state = self.state_mut(symbol)?;
                     let owner = IntentOwner { key: state.key.clone(), strategy: std::mem::replace(
                         &mut state.discovery, StrategyEngine::new(strategy_config)) };
@@ -1211,6 +1233,70 @@ mod tests {
             config, Timeframe::M1, PaperEntryWindow::Always, policy)?)
     }
 
+    fn resting_portfolio() -> Result<MultiPortfolio, Box<dyn Error>> {
+        Ok(MultiPortfolio::new_for_research_with_entry_policy(
+            vec![metadata("ETHUSDT")?, metadata("BTCUSDT")?],
+            PaperConfig::default().with_leverage(10)?, Timeframe::M1,
+            PaperEntryWindow::Always, PaperTargetPolicy::Nearest,
+            PaperFillTiming::ImmediateNextBar, StrategyEntryPolicy::RestingOnConfirmation)?)
+    }
+
+    #[test]
+    fn resting_entry_is_pending_on_confirmation_and_fills_only_a_later_bar() -> TestResult {
+        let mut resting = resting_portfolio()?;
+        let mut legacy = research_portfolio(PaperTargetPolicy::Nearest,
+            PaperConfig::default().with_leverage(10)?)?;
+        let prices = setup(150);
+        for (index, row) in prices.iter().take(24).enumerate() {
+            let candles = batch(i64::try_from(index)?, *row, NEUTRAL)?;
+            resting.process_batch(&candles)?;
+            legacy.process_batch(&candles)?;
+        }
+        let confirmed = resting.snapshot().account;
+        assert_eq!(confirmed.orders.len(), 1);
+        assert_eq!(confirmed.orders[0].state, BookOrderState::Pending);
+        assert_eq!(confirmed.fees_paid, Decimal::ZERO);
+        assert!(legacy.snapshot().account.orders.is_empty());
+        assert_eq!(resting.diagnostics()[0].live.intents, 1);
+        // A real retracement fills the previously resting limit, while the
+        // legacy strategy only now submits its limit for another bar.
+        resting.process_batch(&batch(24, prices[24], NEUTRAL)?)?;
+        legacy.process_batch(&batch(24, prices[24], NEUTRAL)?)?;
+        assert_eq!(resting.snapshot().account.orders[0].state, BookOrderState::Open);
+        assert_eq!(legacy.snapshot().account.orders[0].state, BookOrderState::Pending);
+        assert!(resting.snapshot().account.reserved_risk <= Decimal::ONE);
+        Ok(())
+    }
+
+    #[test]
+    fn resting_policy_survives_owner_transfer_and_warmup_without_spending_in_warmup() -> TestResult {
+        for first_is_warmup in [false, true] {
+            let mut engine = resting_portfolio()?;
+            for (index, row) in setup(1_000).into_iter().enumerate() {
+                let candles = batch(i64::try_from(index)?, row, NEUTRAL)?;
+                if first_is_warmup { engine.warm_up(&candles)?; }
+                else { engine.process_batch(&candles)?; }
+            }
+            assert_eq!(engine.snapshot().account.orders.len(), usize::from(!first_is_warmup));
+            if first_is_warmup {
+                assert_eq!(engine.snapshot().account.balance, Decimal::from(100));
+                assert_eq!(engine.snapshot().account.reserved_risk, Decimal::ZERO);
+            }
+            engine.process_batch(&batch(25, [109, 110, 103, 109], NEUTRAL)?)?;
+            // Stop at FVG confirmation, before the second CE retracement.
+            let rows = subsequent_setup(700, 50);
+            for (index, row) in rows.iter().take(rows.len() - 1).enumerate() {
+                engine.process_batch(&batch(26 + i64::try_from(index)?, *row, NEUTRAL)?)?;
+            }
+            let account = engine.snapshot().account;
+            assert_eq!(account.orders.len(), if first_is_warmup { 1 } else { 2 });
+            assert_eq!(account.orders.iter().filter(|order| order.state == BookOrderState::Pending).count(), 1);
+            assert_eq!(engine.entry_policy(), StrategyEntryPolicy::RestingOnConfirmation);
+            assert!(account.reserved_risk <= Decimal::from(3));
+        }
+        Ok(())
+    }
+
     fn two_targets(near: i64, far: i64) -> Vec<[i64; 4]> {
         let mut prices = setup(far);
         // Both highs form strict five-candle swings before the later sweep.
@@ -1234,6 +1320,8 @@ mod tests {
             config, Timeframe::M1, PaperEntryWindow::Always)?;
         let mut explicit = research_portfolio(PaperTargetPolicy::Nearest, config)?;
         assert_eq!(ordinary.target_policy(), PaperTargetPolicy::Nearest);
+        assert_eq!(ordinary.entry_policy(), StrategyEntryPolicy::LegacyRetracement);
+        assert_eq!(explicit.entry_policy(), StrategyEntryPolicy::LegacyRetracement);
         assert_eq!(portfolio()?.target_policy(), PaperTargetPolicy::Nearest);
         for (index, prices) in two_targets(120, 150).into_iter().enumerate() {
             let candles = batch(i64::try_from(index)?, prices, NEUTRAL)?;

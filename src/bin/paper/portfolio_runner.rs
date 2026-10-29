@@ -607,6 +607,8 @@ fn discard_label(reason: ict_trading_bot::strategy::SetupDiscardReason) -> &'sta
         R::TimeToLiveExpired => "setup hết thời gian chờ", R::MissingNextCandleFvg => "không có FVG ngay sau MSS",
         R::AmbiguousNextCandleFvg => "FVG xác nhận không rõ ràng", R::FarBoundaryViolated => "giá đóng vượt biên FVG",
         R::EntryTouchedOutsideKillzone => "chạm entry ngoài giờ cho phép", R::SeriesReset => "chuỗi nến bị gián đoạn",
+        R::ConfirmationOutsideKillzone => "xác nhận FVG ngoài giờ cho phép",
+        R::SweepExtremeViolated => "giá phá cực trị sweep trước khi đặt lệnh",
         R::FairValueGapInvalidated => "FVG đã mất hiệu lực", R::SupersededByNewSweep => "có sweep mới thay setup cũ",
         R::AmbiguousInput => "tín hiệu mâu thuẫn", R::InvalidSetup => "setup không hợp lệ",
     }
@@ -1021,6 +1023,7 @@ mod notification_tests {
         let discards = [SetupDiscardReason::TimeToLiveExpired, SetupDiscardReason::MissingNextCandleFvg,
             SetupDiscardReason::AmbiguousNextCandleFvg, SetupDiscardReason::FarBoundaryViolated,
             SetupDiscardReason::EntryTouchedOutsideKillzone, SetupDiscardReason::SeriesReset,
+            SetupDiscardReason::ConfirmationOutsideKillzone, SetupDiscardReason::SweepExtremeViolated,
             SetupDiscardReason::FairValueGapInvalidated, SetupDiscardReason::SupersededByNewSweep,
             SetupDiscardReason::AmbiguousInput, SetupDiscardReason::InvalidSetup];
         for symbol in ["BTCUSDT", "ETHUSDT"] {

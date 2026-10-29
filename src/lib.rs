@@ -81,7 +81,7 @@ pub use models::{
     InstrumentId, LiquiditySide, LiquiditySweep, LiquiditySweepInput, MarketKind,
     MarketStructureShift, MarketStructureShiftInput, ModelError, Mss, OrderBlock, OrderBlockInput,
     OrderBlockZoneBasis, PriceRange, PriceZone, SignalEnvelope, SignalEvent, SwingKind, SwingPoint,
-    SymbolCode, Timeframe, TradeIntent, TradeIntentInput, VolumeUnit, ZoneState,
+    SymbolCode, Timeframe, TradeIntent, TradeIntentInput, TradeIntentTrigger, VolumeUnit, ZoneState,
 };
 pub use risk::{
     CircuitBreakerState, InstrumentRiskSpec, LiquidityTarget, ReservationEvent, ReservationStatus,
@@ -91,6 +91,6 @@ pub use risk::{
 pub use risk::{RiskCheckpoint, RiskPlanCheckpoint};
 pub use strategy::{
     CancellationReason, DataDegradationReason, KillzonePolicy, SetupDiscardReason, StrategyAction,
-    StrategyCommand, StrategyConfig, StrategyEngine, StrategyError, StrategyInputRejection,
+    StrategyCommand, StrategyConfig, StrategyEngine, StrategyEntryPolicy, StrategyError, StrategyInputRejection,
     StrategyState,
 };
