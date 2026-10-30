@@ -20,12 +20,19 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+mod market_prices;
+use market_prices::MarketPriceClient;
+
 const ORIGIN: &str = "https://api.telegram.org";
 const QUEUE_CAPACITY: usize = 64;
 const MAX_TEXT_CHARS: usize = 4096;
 const MAX_RESPONSE_BYTES: usize = 65_536;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum complete summary text when reserving room for the optional
+/// 256-character public-price block, including its leading separators.
+pub const MARKET_SUMMARY_MAX_CHARS: usize = MAX_TEXT_CHARS - market_prices::MAX_BLOCK_CHARS;
 
 /// Explicitly enabled Telegram destination, with a secret bot token.
 pub struct TelegramConfig {
@@ -132,6 +139,9 @@ pub enum TelegramError {
     /// Plain text is limited to 4096 Unicode characters.
     #[error("Telegram message exceeds 4096 characters")]
     MessageTooLong,
+    /// A price-enriched summary must leave room for the bounded quote block.
+    #[error("Telegram price-enriched summary exceeds 3840 characters")]
+    MarketSummaryTooLong,
     /// The bounded queue cannot accept another item immediately.
     #[error("Telegram notification queue is full; message was not queued")]
     QueueFull,
@@ -184,10 +194,15 @@ impl Counters {
 /// Call [`Self::shutdown`] to drain for at most five seconds. Dropping the owner
 /// cancels pending work immediately and warns about unconfirmed notifications.
 pub struct TelegramNotifier {
-    sender: Option<mpsc::Sender<String>>,
+    sender: Option<mpsc::Sender<Notification>>,
     task: Option<JoinHandle<()>>,
     cancel: CancellationToken,
     counters: Arc<Counters>,
+}
+
+struct Notification {
+    text: String,
+    with_prices: bool,
 }
 
 impl fmt::Debug for TelegramNotifier {
@@ -209,6 +224,12 @@ impl TelegramNotifier {
     }
 
     fn start(client: TelegramClient) -> Result<Self, TelegramError> {
+        // Optional public-client setup cannot disable the existing notifier.
+        // No price request is made unless an enriched item is actually dequeued.
+        Self::start_with_prices(client, MarketPriceClient::new().ok())
+    }
+
+    fn start_with_prices(client: TelegramClient, prices: Option<MarketPriceClient>) -> Result<Self, TelegramError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| TelegramError::RuntimeUnavailable)?;
         let (sender, receiver) = mpsc::channel(QUEUE_CAPACITY);
@@ -216,6 +237,7 @@ impl TelegramNotifier {
         let counters = Arc::new(Counters::default());
         let task = runtime.spawn(run_worker(
             client,
+            prices,
             receiver,
             cancel.clone(),
             Arc::clone(&counters),
@@ -236,11 +258,27 @@ impl TelegramNotifier {
     /// Rejects empty/oversized text and full/closed queues, increments `rejected`
     /// and emits a sanitized warning. Success only acknowledges enqueueing.
     pub fn try_send(&self, text: String) -> Result<(), TelegramError> {
-        let result = validate_text(&text).and_then(|()| {
+        self.enqueue(text, false)
+    }
+
+    /// Queues a summary with optional fresh BTC/ETH reference prices. The
+    /// worker fetches prices when it dequeues this item, never in the trading
+    /// loop. A three-second public-data deadline falls back to an unavailable
+    /// label; it never prevents sending the original summary or uses a cache.
+    ///
+    /// # Errors
+    /// Rejects empty text, summaries exceeding [`MARKET_SUMMARY_MAX_CHARS`],
+    /// and full/closed queues. Original summary text is never truncated.
+    pub fn try_send_with_prices(&self, text: String) -> Result<(), TelegramError> {
+        self.enqueue(text, true)
+    }
+
+    fn enqueue(&self, text: String, with_prices: bool) -> Result<(), TelegramError> {
+        let result = validate_notification(&text, with_prices).and_then(|()| {
             self.sender
                 .as_ref()
                 .ok_or(TelegramError::WorkerClosed)?
-                .try_send(text)
+                .try_send(Notification { text, with_prices })
                 .map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => TelegramError::QueueFull,
                     mpsc::error::TrySendError::Closed(_) => TelegramError::WorkerClosed,
@@ -320,14 +358,23 @@ fn validate_text(text: &str) -> Result<(), TelegramError> {
     Ok(())
 }
 
+fn validate_notification(text: &str, with_prices: bool) -> Result<(), TelegramError> {
+    validate_text(text)?;
+    if with_prices && text.chars().take(MARKET_SUMMARY_MAX_CHARS + 1).count() > MARKET_SUMMARY_MAX_CHARS {
+        return Err(TelegramError::MarketSummaryTooLong);
+    }
+    Ok(())
+}
+
 async fn run_worker(
     client: TelegramClient,
-    mut receiver: mpsc::Receiver<String>,
+    prices: Option<MarketPriceClient>,
+    mut receiver: mpsc::Receiver<Notification>,
     cancel: CancellationToken,
     counters: Arc<Counters>,
 ) {
     loop {
-        let text = tokio::select! {
+        let notification = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
             text = receiver.recv() => match text {
@@ -338,7 +385,7 @@ async fn run_worker(
         let result = tokio::select! {
             biased;
             () = cancel.cancelled() => return,
-            result = client.send(&text) => result,
+            result = send_notification(&client, prices.as_ref(), notification) => result,
         };
         match result {
             Ok(()) => {
@@ -351,6 +398,22 @@ async fn run_worker(
             }
         }
     }
+}
+
+async fn send_notification(client: &TelegramClient, prices: Option<&MarketPriceClient>,
+    notification: Notification) -> Result<(), DeliveryError>
+{
+    let mut text = notification.text;
+    if notification.with_prices {
+        let block = match prices {
+            Some(prices) => prices.summary().await,
+            None => market_prices::unavailable(chrono::Utc::now()),
+        };
+        text.push_str(&block);
+    }
+    // Defense in depth at composition time; never truncate the accepted body.
+    validate_text(&text).map_err(|_| DeliveryError::MessageBounds)?;
+    client.send(&text).await
 }
 
 struct TelegramClient {
@@ -487,6 +550,8 @@ struct ResponseParameters {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 enum DeliveryError {
+    #[error("composed Telegram message violates text bounds")]
+    MessageBounds,
     #[error("request timed out (delivery outcome unknown)")]
     Timeout,
     #[error("transport failed (delivery outcome unknown)")]
@@ -519,7 +584,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use wiremock::{
-        matchers::{body_json, method, path},
+        matchers::{body_json, method, path, query_param},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -740,6 +805,144 @@ mod tests {
         assert_eq!(stats.unconfirmed, 64);
         assert_eq!(stats.rejected, 3);
         assert_eq!(notifier.try_send("PAPER".to_owned()), Err(TelegramError::WorkerClosed));
+        Ok(())
+    }
+
+    async fn mount_public_prices(server: &MockServer) {
+        for (symbol, price) in [("BTCUSDT", "105432.12345678"), ("ETHUSDT", "3456.78901234")] {
+            Mock::given(method("GET")).and(path("/v5/market/tickers"))
+                .and(query_param("category", "linear")).and(query_param("symbol", symbol))
+                .respond_with(move |_: &wiremock::Request| ResponseTemplate::new(200).set_body_json(json!({
+                    "retCode":0,"result":{"category":"linear","list":[{"symbol":symbol,"lastPrice":price}]},
+                    "time":chrono::Utc::now().timestamp_millis()
+                }))).expect(1).mount(server).await;
+        }
+    }
+
+    fn local_with_prices(server: &MockServer, price_timeout: Duration) -> Result<TelegramNotifier, TelegramError> {
+        TelegramNotifier::start_with_prices(
+            TelegramClient::local(server.uri(), Duration::from_secs(2))?,
+            Some(MarketPriceClient::local(server.uri(), price_timeout).map_err(|_| TelegramError::ClientSetup)?),
+        )
+    }
+
+    #[tokio::test]
+    async fn enriched_summary_preserves_exact_original_body_prices_and_unicode_bound() -> TestResult {
+        let server = MockServer::start().await;
+        mount_public_prices(&server).await;
+        Mock::given(method("POST")).and(path(SEND_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(acknowledgement())).expect(1).mount(&server).await;
+        let notifier = local_with_prices(&server, Duration::from_secs(1))?;
+        let prefix = "[PAPER] TRẠNG THÁI\nBalance: 100 USDT | Equity: 100 USDT\nBTC LONG đang mở\nEntry: 100000 | TP: 104000 | SL: 98000\n";
+        let body = format!("{prefix}{}", "ế".repeat(MARKET_SUMMARY_MAX_CHARS - prefix.chars().count()));
+        assert_eq!(notifier.try_send_with_prices("ế".repeat(MARKET_SUMMARY_MAX_CHARS + 1)), Err(TelegramError::MarketSummaryTooLong));
+        notifier.try_send_with_prices(body.clone())?;
+        let stats = notifier.shutdown().await;
+        assert_eq!((stats.accepted, stats.delivered, stats.failed, stats.rejected), (1, 1, 0, 1));
+        let requests = server.received_requests().await.ok_or("missing requests")?;
+        let post = requests.iter().find(|request| request.url.path() == SEND_PATH).ok_or("missing Telegram POST")?;
+        let sent: serde_json::Value = serde_json::from_slice(&post.body)?;
+        let text = sent["text"].as_str().ok_or("missing text")?;
+        assert!(text.starts_with(&body));
+        assert!(text.contains("Giá tham khảo Bybit Futures"));
+        assert!(text.contains("BTCUSDT: 105432.12345678"));
+        assert!(text.contains("ETHUSDT: 3456.78901234"));
+        assert!(text.contains("Giá giao dịch gần nhất"));
+        assert!(text.contains("Nhận lúc "));
+        assert!(text.contains(" VN\n"));
+        assert!(text.contains("PnL vẫn theo nến"));
+        assert!(text.chars().count() <= MAX_TEXT_CHARS);
+        assert!(text.chars().count() - body.chars().count() <= market_prices::MAX_BLOCK_CHARS);
+        assert_eq!(sent["chat_id"], 42);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_messages_never_request_prices_and_keep_4096_character_limit() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(path("/v5/market/tickers")).respond_with(ResponseTemplate::new(500)).expect(0).mount(&server).await;
+        let text = "ế".repeat(MAX_TEXT_CHARS);
+        Mock::given(method("POST")).and(path(SEND_PATH)).and(body_json(json!({"chat_id":42,"text":text})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(acknowledgement())).expect(1).mount(&server).await;
+        let notifier = local_with_prices(&server, Duration::from_secs(1))?;
+        notifier.try_send(text)?;
+        let stats = notifier.shutdown().await;
+        assert_eq!((stats.accepted, stats.delivered), (1, 1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn price_failure_timeout_or_unavailable_client_still_delivers_original_summary() -> TestResult {
+        for (status, delay, available_client) in [
+            (403, Duration::ZERO, true), (200, Duration::ZERO, true),
+            (200, Duration::from_millis(300), true), (403, Duration::ZERO, false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(path("/v5/market/tickers"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("malformed").set_delay(delay))
+                .mount(&server).await;
+            Mock::given(method("POST")).and(path(SEND_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(acknowledgement())).expect(1).mount(&server).await;
+            let prices = if available_client { Some(MarketPriceClient::local(server.uri(), Duration::from_millis(30))?) } else { None };
+            let notifier = TelegramNotifier::start_with_prices(TelegramClient::local(server.uri(), Duration::from_secs(1))?, prices)?;
+            let body = "[PAPER] Equity: 100 USDT\nLệnh chờ: BTCUSDT Entry: 100000 TP: 104000 SL: 98000";
+            notifier.try_send_with_prices(body.into())?;
+            let stats = notifier.shutdown().await;
+            assert_eq!((stats.accepted, stats.delivered, stats.failed), (1, 1, 0));
+            let requests = server.received_requests().await.ok_or("missing requests")?;
+            let public = requests.iter().filter(|request| request.url.path() == "/v5/market/tickers").count();
+            assert!(public <= 2);
+            if !available_client { assert_eq!(public, 0); }
+            let post = requests.iter().find(|request| request.url.path() == SEND_PATH).ok_or("missing Telegram POST")?;
+            let sent: serde_json::Value = serde_json::from_slice(&post.body)?;
+            let text = sent["text"].as_str().ok_or("missing sent text")?;
+            assert!(text.starts_with(body));
+            assert!(text.contains("BTC/ETH chưa lấy được"));
+            assert!(!text.contains("BTCUSDT:"));
+            assert!(text.chars().count() <= MAX_TEXT_CHARS);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_summary_fetches_at_worker_observation_time_not_enqueue_time() -> TestResult {
+        let server = MockServer::start().await;
+        mount_public_prices(&server).await;
+        Mock::given(method("POST")).and(path(SEND_PATH)).and(body_json(json!({"chat_id":42,"text":"first"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(acknowledgement()).set_delay(Duration::from_millis(1_100)))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(path(SEND_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(acknowledgement())).with_priority(10).expect(1).mount(&server).await;
+        let notifier = local_with_prices(&server, Duration::from_secs(1))?;
+        let queued = chrono::Utc::now().with_timezone(&chrono_tz::Asia::Ho_Chi_Minh).format("%d/%m %H:%M:%S").to_string();
+        // Both calls are synchronous, before this current-thread test yields.
+        notifier.try_send("first".into())?;
+        notifier.try_send_with_prices("[PAPER] bản tin xếp hàng".into())?;
+        assert_eq!(notifier.stats().accepted, 2);
+        let stats = notifier.shutdown().await;
+        assert_eq!(stats.delivered, 2);
+        let requests = server.received_requests().await.ok_or("missing requests")?;
+        let sent = requests.iter().filter(|request| request.url.path() == SEND_PATH)
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body)).collect::<Result<Vec<_>, _>>()?;
+        let text = sent.iter().filter_map(|body| body["text"].as_str()).find(|text| text.starts_with("[PAPER] bản tin xếp hàng"))
+            .ok_or("missing enriched summary")?;
+        assert!(text.contains("BTCUSDT: 105432.12345678"));
+        assert!(!text.contains(&format!("Nhận lúc {queued} VN")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_price_lookup_does_not_send_a_partial_summary() -> TestResult {
+        let server = MockServer::start().await;
+        Mock::given(path("/v5/market/tickers"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("slow").set_delay(Duration::from_secs(1)))
+            .mount(&server).await;
+        Mock::given(path(SEND_PATH)).respond_with(ResponseTemplate::new(200)).expect(0).mount(&server).await;
+        let mut notifier = local_with_prices(&server, Duration::from_secs(2))?;
+        notifier.try_send_with_prices("[PAPER] status".into())?;
+        let stats = notifier.shutdown_with_timeout(Duration::from_millis(30)).await;
+        assert_eq!((stats.accepted, stats.delivered, stats.failed, stats.unconfirmed), (1, 0, 0, 1));
+        assert!(server.received_requests().await.ok_or("missing requests")?.len() <= 2);
         Ok(())
     }
 }

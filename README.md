@@ -50,13 +50,14 @@ Telegram chỉ là kênh thông báo, không điều khiển giao dịch. Tính 
 Mặc định mỗi 30 phút có **một tin cập nhật tổng hợp** (`--heartbeat-seconds`, tối thiểu 60), gồm:
 
 - Số dư, tổng tài sản, lãi/lỗ đã ghi nhận sau phí, lãi/lỗ đang mở, phí và số lệnh đã đóng.
+- Giá giao dịch gần nhất của BTCUSDT và ETHUSDT trên Bybit Futures, kèm giờ nhận theo Việt Nam; có cả trong tin khởi động. Worker Telegram lấy hai giá tại lúc gửi, với thời hạn chung 3 giây. Nếu lỗi hoặc dữ liệu cũ, bản tin ghi chưa lấy được giá và vẫn gửi phần trạng thái. Giá này chỉ để tham khảo; không thay Entry/TP/SL, quyết định vào lệnh hoặc PnL theo nến M1.
 - Từng lệnh **CHỜ KHỚP/ĐANG MỞ** của BTC/ETH: LONG/SHORT, Entry, TP, SL, khối lượng, rủi ro/vốn giữ chỗ; cùng số chỗ còn lại, vốn khả dụng và đòn bẩy x10. Hai lệnh cùng cặp vẫn có giá và mã riêng.
 - Trạng thái dữ liệu, lịch vào lệnh, điều kiện đang chặn lệnh mới và số lần thử lại/phục hồi. `always` xét setup 24/7; `killzones` dùng giờ New York có DST, thứ Hai–thứ Sáu. Vị thế đang có vẫn được mô phỏng ngoài giờ tạo lệnh.
 - BTC/ETH đang chờ sweep, MSS, FVG hay hồi giá; số setup đủ chuỗi, limit được nhận, lượt từ chối và nguyên nhân phổ biến nhất. Số liệu cộng dồn từ đầu phiên, bỏ warmup/nến trùng và bắt đầu lại sau restart. Tín hiệu sweep/MSS/FVG riêng lẻ không đồng nghĩa có setup đủ điều kiện; limit được nhận chưa có nghĩa đã khớp. Thống kê đầy đủ vẫn ở console, không gửi thêm hai tin riêng mỗi kỳ.
 
 Chẩn đoán nhận lệnh phân biệt **RR trước phí**, **RR sau chi phí**, khối lượng tối thiểu, thiếu vốn, giới hạn risk/slot và thiếu mục tiêu TP. Khi risk manager trả số RR trước phí hoặc khối lượng cụ thể, tin hiển thị đúng số đó và ngưỡng so sánh; lỗi RR sau chi phí hiện chỉ có loại lỗi, **không tự suy đoán một số net RR**. Lần từ chối gần nhất có giờ nến theo Việt Nam: đây là lịch sử, không khẳng định điều kiện đó vẫn đang chặn setup hiện tại. Console mỗi nến chỉ thêm chi tiết từ chối phát sinh đúng nến đó. Bộ đếm admission chỉ tính intent bị từ chối cuối cùng; thử TP nghiên cứu thất bại rồi chọn được TP khác không bị ghi thành một lệnh bị loại. Các quan sát này không thay quyết định giao dịch hoặc schema journal V1–V4.
 
-Thông báo vòng đời phân biệt rõ **ĐẶT LIMIT — CHƯA KHỚP**, **ĐÃ KHỚP LỆNH MÔ PHỎNG**, **ĐÃ HỦY LIMIT CHƯA KHỚP**, **ĐÃ CHỐT TP** và **ĐÃ CẮT SL**. Tin đóng lệnh có giá thoát và lãi/lỗ ròng của chính lệnh đó; tin khởi động/dừng hoặc tạm ngừng lệnh mới không được coi là đã đóng vị thế. Toàn bộ cập nhật dựa trên nến đóng, không phải giá tick hay xác nhận khớp lệnh từ sàn.
+Thông báo vòng đời phân biệt rõ **ĐẶT LIMIT — CHƯA KHỚP**, **ĐÃ KHỚP LỆNH MÔ PHỎNG**, **ĐÃ HỦY LIMIT CHƯA KHỚP**, **ĐÃ CHỐT TP** và **ĐÃ CẮT SL**. Tin đóng lệnh có giá thoát và lãi/lỗ ròng của chính lệnh đó; tin khởi động/dừng hoặc tạm ngừng lệnh mới không được coi là đã đóng vị thế. Cập nhật vòng đời lệnh và PnL dựa trên nến đóng, không phải giá tick hay xác nhận khớp lệnh từ sàn.
 
 Thiết lập lần đầu bằng **bot mới dành riêng cho paper**:
 

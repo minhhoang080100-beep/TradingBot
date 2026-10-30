@@ -7,7 +7,7 @@ use futures_util::future::try_join_all;
 use ict_trading_bot::{
     ict_engine::{Killzone, KillzoneFilter},
     paper::{BookOrderState, PaperConfig, PaperEntryWindow, PaperEvent, PaperInstrument, PaperMarketError, PaperOrderSnapshot, MultiPortfolio as PaperPortfolio, PortfolioEvent, MultiPortfolioSnapshot as PortfolioSnapshot, PublicPaperMarket},
-    telegram::{TelegramConfig, TelegramNotifier},
+    telegram::{TelegramConfig, TelegramNotifier, MARKET_SUMMARY_MAX_CHARS},
     Candle, Direction, Timeframe,
 };
 use uuid::Uuid;
@@ -104,7 +104,7 @@ async fn run_session(options: &PortfolioOptions, notifier: Option<&TelegramNotif
     println!("PAPER PORTFOLIO V4 | max_active=4 | max_per_symbol=2 | total_risk_cap=3% | symbols={} | initial={} USDT | leverage={}x | entry_window={} | warmup={} each | candle_delay=10s | session={} | log={}",
         options.symbols.join(","), options.config.initial_balance(), options.config.leverage(), options.entry_window.as_str(), options.warmup, session, options.output.display());
     println!("{}", serde_json::to_string(&engine.snapshot())?);
-    notify(notifier, startup_message(session, options, cursor));
+    notify_with_prices(notifier, startup_message(session, options, cursor));
     let outcome = collect(&market, &instruments, options, &mut engine, &mut log, &mut recent, &mut cursor,
         notifier, session, shutdown, &mut recovery_state).await;
     let reason = outcome.as_ref().map_or("error", |reason| *reason);
@@ -176,7 +176,7 @@ async fn collect(
                 ensure_joint_feed_current(*cursor, stale_at)?;
                 let diagnostics = engine.diagnostics();
                 let message = heartbeat_message(session, *cursor, &engine.snapshot(), recovery_state, engine.entry_window(), &diagnostics);
-                notify(notifier, message);
+                notify_with_prices(notifier, message);
                 // Technical counters stay in console; Telegram receives one
                 // bounded account/position/setup digest instead of three texts.
                 for diagnostic in diagnostics {
@@ -391,6 +391,23 @@ fn retain(recent: &mut VecDeque<Vec<Candle>>, batch: Vec<Candle>) {
 fn notify(notifier: Option<&TelegramNotifier>, message: String) {
     if let Some(notifier) = notifier {
         if let Err(error) = notifier.try_send(message) { eprintln!("Telegram notification not queued: {error}"); }
+    }
+}
+
+fn price_summary_body(message: String) -> String {
+    if message.chars().count() <= MARKET_SUMMARY_MAX_CHARS { return message; }
+    // Account and every order appear before the optional diagnostic tail.
+    // Reserve space for the ticker block without dropping Entry/TP/SL rows.
+    let mut bounded: String = message.chars().take(MARKET_SUMMARY_MAX_CHARS - 40).collect();
+    bounded.push_str("\n… Xem nhật ký để có đầy đủ chi tiết.");
+    bounded
+}
+
+fn notify_with_prices(notifier: Option<&TelegramNotifier>, message: String) {
+    if let Some(notifier) = notifier {
+        if let Err(error) = notifier.try_send_with_prices(price_summary_body(message)) {
+            eprintln!("Telegram market summary not queued: {error}");
+        }
     }
 }
 
@@ -867,7 +884,7 @@ mod notification_tests {
         snapshot.account.wins = u64::MAX;
         snapshot.account.losses = u64::MAX;
         let rows = [max_diagnostic("BTCUSDT")?, max_diagnostic("ETHUSDT")?];
-        let message = heartbeat_message(Uuid::from_u128(7), at(420)?, &snapshot, &recovery, PaperEntryWindow::Killzones, &rows);
+        let message = price_summary_body(heartbeat_message(Uuid::from_u128(7), at(420)?, &snapshot, &recovery, PaperEntryWindow::Killzones, &rows));
         assert!(message.contains("Lệnh chờ + mở: 4/4 (BTC 2/2, ETH 2/2)"));
         assert_eq!(message.matches("Mã lệnh:").count(), 4);
         for active in &snapshot.account.orders {
@@ -876,7 +893,10 @@ mod notification_tests {
         assert!(message.contains("CHỜ KHỚP BTCUSDT"));
         assert!(message.contains("ĐANG MỞ ETHUSDT"));
         assert!(!message.contains("Chưa có lệnh chờ hoặc vị thế mở."));
-        assert!(message.chars().count() <= 4096);
+        assert!(message.chars().count() <= MARKET_SUMMARY_MAX_CHARS);
+        assert_eq!(message.matches("Entry:").count(), 4);
+        assert_eq!(message.matches(" | TP:").count(), 4);
+        assert_eq!(message.matches(" | SL:").count(), 4);
         assert_eq!(message.matches("[PAPER]").count(), 1);
         assert!(message.contains("thiếu mục tiêu thanh khoản để đặt TP"));
         assert!(!message.contains("NoOpposingLiquidity"));
